@@ -26,7 +26,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.pedro.common.ConnectChecker
 import com.pedro.library.rtmp.RtmpCamera2
-import com.pedro.library.util.CameraHelper
+import com.pedro.encoder.input.video.CameraHelper
 import com.pedro.library.view.OpenGlView
 
 class MainActivity : ComponentActivity() {
