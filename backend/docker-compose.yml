@@ -1,0 +1,11 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    restart: unless-stopped
+    ports:
+      - "1935:1935"      # RTMP ingest (phone -> server)
+      - "8888:8888"      # LL-HLS playback
+      - "8889:8889"      # WebRTC (WHEP) playback
+      - "8189:8189/udp"  # WebRTC media
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
