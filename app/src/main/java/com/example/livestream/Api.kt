@@ -1,51 +1,49 @@
 package com.example.livestream
 
-import android.os.Handler
-import android.os.Looper
-import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 object Api {
-    data class Room(val id: String, val title: String, val host: String, val viewers: Int)
+    data class Stream(val id: String, val title: String, val host: String, val viewers: Int)
+    data class Join(val id: String, val url: String, val token: String)
 
-    private val http = OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build()
-    private fun base(h: String) = "http://$h:3000"
+    private val http = OkHttpClient()
 
-    fun rtmp(h: String, id: String) = "rtmp://$h:1935/live/$id"
-    fun hls(h: String, id: String) = "http://$h:8888/live/$id/index.m3u8"
+    private fun base(s: String): String {
+        val t = s.trim().trimEnd('/')
+        return if (t.startsWith("http")) t else "https://$t"
+    }
 
-    fun rooms(h: String): List<Room> =
-        http.newCall(Request.Builder().url("${base(h)}/rooms").build()).execute().use { r ->
+    fun streams(server: String): List<Stream> =
+        http.newCall(Request.Builder().url("${base(server)}/rooms").build()).execute().use { r ->
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Room(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"))
+                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"))
             }
         }
 
-    fun createRoom(h: String, title: String, user: String): String {
+    fun createRoom(server: String, title: String, user: String): Join {
         val body = JSONObject().put("title", title).put("host", user).toString()
             .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("${base(h)}/rooms").post(body).build()
-        return http.newCall(req).execute().use { JSONObject(it.body!!.string()).getString("id") }
+        val req = Request.Builder().url("${base(server)}/rooms").post(body).build()
+        return http.newCall(req).execute().use { r ->
+            val o = JSONObject(r.body!!.string())
+            Join(o.getString("id"), o.getString("url"), o.getString("token"))
+        }
     }
 
-    fun socket(h: String, id: String, user: String, isHost: Boolean, onEvent: (JSONObject) -> Unit): WebSocket {
-        val url = HttpUrl.Builder().scheme("http").host(h).port(3000).addPathSegment("ws")
-            .addQueryParameter("room", id).addQueryParameter("user", user)
-            .addQueryParameter("host", if (isHost) "1" else "0").build()
-        val main = Handler(Looper.getMainLooper())
-        return http.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                try { val o = JSONObject(text); main.post { onEvent(o) } } catch (_: Exception) {}
-            }
-        })
+    fun viewerToken(server: String, room: String, user: String): Join {
+        val url = "${base(server)}/token".toHttpUrl().newBuilder()
+            .addQueryParameter("room", room).addQueryParameter("user", user).build()
+        return http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            val o = JSONObject(r.body!!.string())
+            Join(room, o.getString("url"), o.getString("token"))
+        }
     }
 }
-
-fun WebSocket.chat(t: String) = send(JSONObject().put("type", "chat").put("text", t).toString())
-fun WebSocket.gift(g: String) = send(JSONObject().put("type", "gift").put("gift", g).toString())

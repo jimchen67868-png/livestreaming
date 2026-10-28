@@ -4,9 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.SurfaceHolder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,20 +25,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.media3.common.MediaItem
-import androidx.media3.common.PlaybackException
-import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
-import com.pedro.common.ConnectChecker
-import com.pedro.encoder.input.video.CameraHelper
-import com.pedro.library.rtmp.RtmpCamera2
-import com.pedro.library.view.OpenGlView
+import io.livekit.android.LiveKit
+import io.livekit.android.events.RoomEvent
+import io.livekit.android.renderer.TextureViewRenderer
+import io.livekit.android.room.Room
+import io.livekit.android.room.track.LocalVideoTrack
+import io.livekit.android.room.track.Track
+import io.livekit.android.room.track.VideoTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.WebSocket
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
@@ -53,7 +47,7 @@ class MainActivity : ComponentActivity() {
 
 sealed interface Screen {
     object Home : Screen
-    data class Watch(val room: Api.Room) : Screen
+    data class Watch(val stream: Api.Stream) : Screen
     object Live : Screen
 }
 
@@ -61,56 +55,81 @@ sealed interface Screen {
 fun App() {
     val ctx = LocalContext.current
     val sp = remember { ctx.getSharedPreferences("s", 0) }
-    var host by remember { mutableStateOf(sp.getString("host", "") ?: "") }
+    var server by remember { mutableStateOf(sp.getString("server", "") ?: "") }
     var user by remember { mutableStateOf(sp.getString("user", "user" + (100..999).random()) ?: "user") }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     when (val s = screen) {
-        Screen.Home -> HomeScreen(host, user,
-            { h, u -> host = h; user = u; sp.edit().putString("host", h).putString("user", u).apply() },
+        Screen.Home -> HomeScreen(server, user,
+            { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
             { screen = Screen.Watch(it) }, { screen = Screen.Live })
-        is Screen.Watch -> WatchScreen(host, user, s.room) { screen = Screen.Home }
-        Screen.Live -> BroadcastScreen(host, user) { screen = Screen.Home }
+        is Screen.Watch -> WatchScreen(server, user, s.stream) { screen = Screen.Home }
+        Screen.Live -> BroadcastScreen(server, user) { screen = Screen.Home }
     }
 }
 
-fun handleEvent(e: JSONObject, msgs: MutableList<String>, onViewers: (Int) -> Unit, onEnd: () -> Unit) {
-    when (e.optString("type")) {
-        "chat" -> msgs.add("${e.optString("user")}: ${e.optString("text")}")
-        "gift" -> msgs.add("${e.optString("user")} sent ${e.optString("gift")}")
-        "viewers" -> onViewers(e.optInt("count"))
-        "end" -> onEnd()
+// ---------- chat over LiveKit data messages ----------
+suspend fun Room.sendChat(text: String) {
+    localParticipant.publishData(JSONObject().put("t", "chat").put("text", text).toString().toByteArray())
+}
+suspend fun Room.sendGift(g: String) {
+    localParticipant.publishData(JSONObject().put("t", "gift").put("g", g).toString().toByteArray())
+}
+fun parseData(name: String, bytes: ByteArray): String? = try {
+    val o = JSONObject(String(bytes))
+    when (o.optString("t")) {
+        "chat" -> "$name: ${o.optString("text")}"
+        "gift" -> "$name sent ${o.optString("g")}"
+        else -> null
     }
-    while (msgs.size > 50) msgs.removeAt(0)
+} catch (e: Exception) { null }
+
+fun MutableList<String>.addCapped(s: String) { add(s); while (size > 50) removeAt(0) }
+
+fun remoteVideo(room: Room): VideoTrack? = room.remoteParticipants.values.firstNotNullOfOrNull {
+    it.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
 }
 
 @Composable
+fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier) {
+    var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
+    AndroidView(
+        factory = { c -> TextureViewRenderer(c).also { room.initVideoRenderer(it); renderer = it } },
+        modifier = modifier
+    )
+    DisposableEffect(track, renderer) {
+        val r = renderer
+        if (track != null && r != null) track.addRenderer(r)
+        onDispose { if (track != null && r != null) track.removeRenderer(r) }
+    }
+}
+
+// ---------- screens ----------
+@Composable
 fun HomeScreen(
-    host: String, user: String, onSettings: (String, String) -> Unit,
-    onOpen: (Api.Room) -> Unit, onGoLive: () -> Unit
+    server: String, user: String, onSettings: (String, String) -> Unit,
+    onOpen: (Api.Stream) -> Unit, onGoLive: () -> Unit
 ) {
-    var rooms by remember { mutableStateOf(listOf<Api.Room>()) }
+    var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
-    LaunchedEffect(host) {
+    LaunchedEffect(server) {
         while (true) {
-            if (host.isNotBlank()) {
-                try { rooms = withContext(Dispatchers.IO) { Api.rooms(host) }; err = "" }
+            if (server.isNotBlank()) {
+                try { streams = withContext(Dispatchers.IO) { Api.streams(server) }; err = "" }
                 catch (e: Exception) { err = "Can't reach server" }
             }
-            delay(4000)
+            delay(8000)
         }
     }
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Live now", style = MaterialTheme.typography.headlineSmall)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(host, { onSettings(it.trim(), user) }, label = { Text("Server IP") },
-                singleLine = true, modifier = Modifier.weight(1f))
-            OutlinedTextField(user, { onSettings(host, it) }, label = { Text("Name") },
-                singleLine = true, modifier = Modifier.weight(1f))
-        }
+        OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
+            singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(user, { onSettings(server, it) }, label = { Text("Name") },
+            singleLine = true, modifier = Modifier.fillMaxWidth())
         if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (rooms.isEmpty()) item { Text("No one is live yet") }
-            items(rooms, key = { it.id }) { r ->
+            if (streams.isEmpty()) item { Text("No one is live yet") }
+            items(streams, key = { it.id }) { r ->
                 Card(Modifier.fillMaxWidth().clickable { onOpen(r) }) {
                     Column(Modifier.padding(16.dp)) {
                         Text(r.title, style = MaterialTheme.typography.titleMedium)
@@ -119,7 +138,7 @@ fun HomeScreen(
                 }
             }
         }
-        Button(onGoLive, Modifier.fillMaxWidth(), enabled = host.isNotBlank()) { Text("Go Live") }
+        Button(onGoLive, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) { Text("Go Live") }
     }
 }
 
@@ -141,45 +160,57 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (Stri
 }
 
 @Composable
-fun WatchScreen(host: String, user: String, room: Api.Room, onBack: () -> Unit) {
+fun WatchScreen(server: String, user: String, stream: Api.Stream, onBack: () -> Unit) {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val lk = remember { LiveKit.create(ctx.applicationContext) }
     val msgs = remember { mutableStateListOf<String>() }
-    var viewers by remember { mutableIntStateOf(room.viewers) }
+    var viewers by remember { mutableIntStateOf(0) }
+    var video by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
-    val alive = remember { booleanArrayOf(true) }
-    val player = remember {
-        ExoPlayer.Builder(ctx).build().apply {
-            setMediaItem(MediaItem.Builder().setUri(Api.hls(host, room.id)).setLiveConfiguration(
-                MediaItem.LiveConfiguration.Builder().setTargetOffsetMs(2000)
-                    .setMinPlaybackSpeed(0.97f).setMaxPlaybackSpeed(1.03f).build()).build())
-            addListener(object : Player.Listener {
-                override fun onPlayerError(error: PlaybackException) {
-                    Handler(Looper.getMainLooper()).postDelayed({ if (alive[0]) prepare() }, 2000)
+    var status by remember { mutableStateOf("Connecting…") }
+
+    LaunchedEffect(Unit) {
+        try {
+            val j = withContext(Dispatchers.IO) { Api.viewerToken(server, stream.id, user) }
+            launch {
+                lk.events.collect { e ->
+                    when (e) {
+                        is RoomEvent.TrackSubscribed -> (e.track as? VideoTrack)?.let { video = it }
+                        is RoomEvent.DataReceived ->
+                            parseData(e.participant?.name ?: "?", e.data)?.let { msgs.addCapped(it) }
+                        is RoomEvent.ParticipantConnected -> viewers = lk.remoteParticipants.size
+                        is RoomEvent.ParticipantDisconnected -> {
+                            viewers = lk.remoteParticipants.size
+                            if (e.participant.identity?.value?.startsWith("host-") == true) ended = true
+                        }
+                        is RoomEvent.Disconnected -> ended = true
+                        else -> {}
+                    }
                 }
-            })
-            prepare(); playWhenReady = true
-        }
+            }
+            lk.connect(j.url, j.token)
+            viewers = lk.remoteParticipants.size
+            video = remoteVideo(lk)
+            status = ""
+        } catch (e: Exception) { status = "Error: ${e.message}" }
     }
-    val ws = remember {
-        Api.socket(host, room.id, user, false) { e ->
-            handleEvent(e, msgs, { c -> viewers = c }, { ended = true })
-        }
-    }
-    DisposableEffect(Unit) { onDispose { alive[0] = false; ws.close(1000, null); player.release() } }
+    DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
     BackHandler(onBack = onBack)
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView({ PlayerView(it).apply { useController = false; this.player = player } }, Modifier.fillMaxSize())
-        Text("${room.title} • 👁 $viewers", color = Color.White,
+        VideoView(lk, video, Modifier.fillMaxSize())
+        Text("${stream.title} • 👁 $viewers", color = Color.White,
             modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(12.dp))
         if (ended) Text("Stream ended", color = Color.White, modifier = Modifier.align(Alignment.Center))
+        else if (status.isNotEmpty()) Text(status, color = Color.White, modifier = Modifier.align(Alignment.Center))
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
             Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("❤️", "🌹", "🚀").forEach { g ->
-                    FilledTonalButton({ ws.gift(g) }) { Text(g) }
+                    FilledTonalButton({ msgs.addCapped("$user sent $g"); scope.launch { lk.sendGift(g) } }) { Text(g) }
                 }
             }
-            ChatOverlay(msgs, onSend = { ws.chat(it) })
+            ChatOverlay(msgs, onSend = { msgs.addCapped("$user: $it"); scope.launch { lk.sendChat(it) } })
         }
     }
 }
@@ -188,7 +219,7 @@ private fun hasPerms(c: Context) = listOf(Manifest.permission.CAMERA, Manifest.p
     .all { ContextCompat.checkSelfPermission(c, it) == PackageManager.PERMISSION_GRANTED }
 
 @Composable
-fun BroadcastScreen(host: String, user: String, onBack: () -> Unit) {
+fun BroadcastScreen(server: String, user: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     var granted by remember { mutableStateOf(hasPerms(ctx)) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -198,7 +229,7 @@ fun BroadcastScreen(host: String, user: String, onBack: () -> Unit) {
         if (!granted) launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
     }
     BackHandler(enabled = !granted, onBack = onBack)
-    if (granted) BroadcastContent(host, user, onBack)
+    if (granted) BroadcastContent(server, user, onBack)
     else Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
         Text("Camera and microphone access is needed to broadcast.")
         Spacer(Modifier.height(12.dp))
@@ -209,81 +240,50 @@ fun BroadcastScreen(host: String, user: String, onBack: () -> Unit) {
 }
 
 @Composable
-fun BroadcastContent(host: String, user: String, onBack: () -> Unit) {
+fun BroadcastContent(server: String, user: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lk = remember { LiveKit.create(ctx.applicationContext) }
     var title by rememberSaveable { mutableStateOf("$user's live") }
     var live by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Ready") }
     var viewers by remember { mutableIntStateOf(0) }
+    var cam by remember { mutableStateOf<LocalVideoTrack?>(null) }
     val msgs = remember { mutableStateListOf<String>() }
-    var camera by remember { mutableStateOf<RtmpCamera2?>(null) }
-    var ws by remember { mutableStateOf<WebSocket?>(null) }
 
-    val checker = remember {
-        object : ConnectChecker {
-            override fun onConnectionStarted(url: String) { status = "Connecting…" }
-            override fun onConnectionSuccess() { status = "LIVE"; live = true }
-            override fun onConnectionFailed(reason: String) {
-                status = "Failed: $reason"; live = false; camera?.stopStream(); ws?.close(1000, null); ws = null
+    LaunchedEffect(Unit) {
+        lk.events.collect { e ->
+            when (e) {
+                is RoomEvent.DataReceived ->
+                    parseData(e.participant?.name ?: "?", e.data)?.let { msgs.addCapped(it) }
+                is RoomEvent.ParticipantConnected, is RoomEvent.ParticipantDisconnected ->
+                    viewers = lk.remoteParticipants.size
+                else -> {}
             }
-            override fun onNewBitrate(bitrate: Long) {}
-            override fun onDisconnect() { status = "Disconnected"; live = false }
-            override fun onAuthError() { status = "Auth error" }
-            override fun onAuthSuccess() {}
         }
     }
 
     fun stop() {
-        camera?.let { if (it.isStreaming) it.stopStream() }
-        ws?.close(1000, null); ws = null; live = false; status = "Ended"
+        lk.disconnect(); live = false; cam = null; status = "Ended"
     }
     fun start() {
-        val cam = camera ?: return
-        status = "Starting…"
         scope.launch {
             try {
-                val id = withContext(Dispatchers.IO) { Api.createRoom(host, title, user) }
-                if (!(cam.prepareAudio() &&
-                        cam.prepareVideo(1280, 720, 30, 2_500_000, 1, CameraHelper.getCameraOrientation(ctx)))) {
-                    status = "Encoder not supported"; return@launch
-                }
-                ws = Api.socket(host, id, user, true) { e ->
-                    handleEvent(e, msgs, { c -> viewers = c }, {})
-                }
-                cam.startStream(Api.rtmp(host, id))
+                status = "Starting…"
+                val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user) }
+                lk.connect(j.url, j.token)
+                lk.localParticipant.setCameraEnabled(true)
+                lk.localParticipant.setMicrophoneEnabled(true)
+                cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                live = true; status = "LIVE"
             } catch (e: Exception) { status = "Error: ${e.message}" }
         }
     }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            camera?.let { if (it.isStreaming) it.stopStream(); if (it.isOnPreview) it.stopPreview() }
-            ws?.close(1000, null)
-        }
-    }
+    DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
     BackHandler { stop(); onBack() }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(
-            factory = { c ->
-                OpenGlView(c).also { v ->
-                    val cam = RtmpCamera2(v, checker)
-                    camera = cam
-                    v.holder.addCallback(object : SurfaceHolder.Callback {
-                        override fun surfaceCreated(h: SurfaceHolder) {}
-                        override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {
-                            if (!cam.isOnPreview) cam.startPreview(CameraHelper.Facing.BACK)
-                        }
-                        override fun surfaceDestroyed(h: SurfaceHolder) {
-                            if (cam.isStreaming) cam.stopStream()
-                            if (cam.isOnPreview) cam.stopPreview()
-                        }
-                    })
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        VideoView(lk, cam, Modifier.fillMaxSize())
         Column(Modifier.align(Alignment.TopStart).statusBarsPadding().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("$status • 👁 $viewers", color = Color.White,
@@ -291,10 +291,10 @@ fun BroadcastContent(host: String, user: String, onBack: () -> Unit) {
             if (!live) OutlinedTextField(title, { title = it }, label = { Text("Title") }, singleLine = true)
         }
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (live) ChatOverlay(msgs, onSend = { ws?.chat(it) })
+            if (live) ChatOverlay(msgs, onSend = { msgs.addCapped("$user: $it"); scope.launch { lk.sendChat(it) } })
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
-                OutlinedButton({ camera?.switchCamera() }) { Text("Flip") }
+                OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
             }
         }
     }
