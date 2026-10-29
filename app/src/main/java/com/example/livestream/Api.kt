@@ -9,7 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object Api {
-    data class Stream(val id: String, val title: String, val host: String, val viewers: Int)
+    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "")
     data class Join(val id: String, val url: String, val token: String)
 
     private val http = OkHttpClient()
@@ -24,7 +24,7 @@ object Api {
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"))
+                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"))
             }
         }
 
@@ -36,6 +36,12 @@ object Api {
             val o = JSONObject(r.body!!.string())
             Join(o.getString("id"), o.getString("url"), o.getString("token"))
         }
+    }
+
+    fun setThumb(server: String, id: String, b64: String) {
+        val body = JSONObject().put("thumb", b64).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/rooms/$id/thumb").post(body).build())
+            .execute().close()
     }
 
     fun viewerToken(server: String, room: String, user: String): Join {

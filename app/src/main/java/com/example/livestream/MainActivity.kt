@@ -9,11 +9,22 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
+import java.io.ByteArrayOutputStream
+import androidx.compose.foundation.Image
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,6 +33,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
@@ -90,11 +104,50 @@ fun remoteVideo(room: Room): VideoTrack? = room.remoteParticipants.values.firstN
     it.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
 }
 
+fun snapshot(v: TextureViewRenderer): String? {
+    try {
+        if (v.width == 0 || v.height == 0) return null
+        val h = (240f * v.height / v.width).toInt().coerceAtLeast(1)
+        val full = v.getBitmap(240, h) ?: return null
+        val side = minOf(full.width, full.height)
+        val sq = Bitmap.createBitmap(full, (full.width - side) / 2, (full.height - side) / 2, side, side)
+        val out = ByteArrayOutputStream()
+        Bitmap.createScaledBitmap(sq, 160, 160, true).compress(Bitmap.CompressFormat.JPEG, 60, out)
+        return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+    } catch (e: Exception) { return null }
+}
+
+fun decodeThumb(b64: String): ImageBitmap? = try {
+    if (b64.isEmpty()) null else {
+        val b = Base64.decode(b64, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(b, 0, b.size)?.asImageBitmap()
+    }
+} catch (e: Exception) { null }
+
+fun viewerNames(room: Room): List<String> = room.remoteParticipants.values
+    .filter { it.identity?.value?.startsWith("host-") != true }
+    .map { it.name ?: it.identity?.value ?: "guest" }
+
 @Composable
-fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier) {
+fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClose) { Text("Close") } },
+        title = { Text("Viewers (${names.size})") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (names.isEmpty()) Text("No viewers yet")
+                names.forEach { Text(it) }
+            }
+        }
+    )
+}
+
+@Composable
+fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onReady: (TextureViewRenderer) -> Unit = {}) {
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     AndroidView(
-        factory = { c -> TextureViewRenderer(c).also { room.initVideoRenderer(it); renderer = it } },
+        factory = { c -> TextureViewRenderer(c).also { room.initVideoRenderer(it); renderer = it; onReady(it) } },
         modifier = modifier
     )
     DisposableEffect(track, renderer) {
@@ -128,13 +181,19 @@ fun HomeScreen(
         OutlinedTextField(user, { onSettings(server, it) }, label = { Text("Name") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
         if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (streams.isEmpty()) item { Text("No one is live yet") }
+        LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (streams.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { Text("No one is live yet") }
             items(streams, key = { it.id }) { r ->
                 Card(Modifier.fillMaxWidth().clickable { onOpen(r) }) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(r.title, style = MaterialTheme.typography.titleMedium)
-                        Text("${r.host} • 👁 ${r.viewers}")
+                    val img = remember(r.thumb) { decodeThumb(r.thumb) }
+                    if (img != null) Image(img, null, Modifier.fillMaxWidth().aspectRatio(1f),
+                        contentScale = ContentScale.Crop)
+                    else Box(Modifier.fillMaxWidth().aspectRatio(1f).background(Color(0xFF333333)),
+                        contentAlignment = Alignment.Center) { Text("📺") }
+                    Column(Modifier.padding(10.dp)) {
+                        Text(r.title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+                        Text("${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                     }
                 }
             }
@@ -170,6 +229,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onBack: () -> 
     var video by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
+    var showViewers by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         try {
@@ -202,7 +262,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onBack: () -> 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         VideoView(lk, video, Modifier.fillMaxSize())
         Text("${stream.title} • 👁 $viewers", color = Color.White,
-            modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(12.dp))
+            modifier = Modifier.align(Alignment.TopStart).statusBarsPadding()
+                .clickable { showViewers = true }.padding(12.dp))
+        if (showViewers) ViewerListDialog(
+            remember(viewers, showViewers) { viewerNames(lk) + "$user (you)" }) { showViewers = false }
         if (ended) Text("Stream ended", color = Color.White, modifier = Modifier.align(Alignment.Center))
         else if (status.isNotEmpty()) Text(status, color = Color.White, modifier = Modifier.align(Alignment.Center))
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
@@ -250,6 +313,9 @@ fun BroadcastContent(server: String, user: String, onBack: () -> Unit) {
     var status by remember { mutableStateOf("Ready") }
     var viewers by remember { mutableIntStateOf(0) }
     var cam by remember { mutableStateOf<LocalVideoTrack?>(null) }
+    var showViewers by remember { mutableStateOf(false) }
+    var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
+    var roomId by remember { mutableStateOf("") }
     val msgs = remember { mutableStateListOf<String>() }
 
     LaunchedEffect(Unit) {
@@ -259,6 +325,7 @@ fun BroadcastContent(server: String, user: String, onBack: () -> Unit) {
                     parseData(e.participant?.name ?: "?", e.data)?.let { msgs.addCapped(it) }
                 is RoomEvent.ParticipantConnected, is RoomEvent.ParticipantDisconnected ->
                     viewers = lk.remoteParticipants.size
+                is RoomEvent.Disconnected -> { live = false; cam = null; status = "Disconnected" }
                 else -> {}
             }
         }
@@ -272,6 +339,7 @@ fun BroadcastContent(server: String, user: String, onBack: () -> Unit) {
             try {
                 status = "Starting…"
                 val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user) }
+                roomId = j.id
                 lk.connect(j.url, j.token)
                 lk.localParticipant.setCameraEnabled(true)
                 lk.localParticipant.setMicrophoneEnabled(true)
@@ -281,14 +349,43 @@ fun BroadcastContent(server: String, user: String, onBack: () -> Unit) {
         }
     }
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner, live) {
+        val obs = LifecycleEventObserver { _, ev ->
+            if (ev == Lifecycle.Event.ON_RESUME && live) scope.launch {
+                try {
+                    lk.localParticipant.setCameraEnabled(false)
+                    lk.localParticipant.setCameraEnabled(true)
+                    cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                } catch (e: Exception) { status = "Camera error: ${e.message}" }
+            }
+        }
+        owner.lifecycle.addObserver(obs)
+        onDispose { owner.lifecycle.removeObserver(obs) }
+    }
+    LaunchedEffect(live) {
+        if (live) {
+            delay(3000)
+            while (true) {
+                val b64 = renderer?.let { snapshot(it) }
+                if (b64 != null) withContext(Dispatchers.IO) {
+                    try { Api.setThumb(server, roomId, b64) } catch (e: Exception) {}
+                }
+                delay(30000)
+            }
+        }
+    }
     BackHandler { stop(); onBack() }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        VideoView(lk, cam, Modifier.fillMaxSize())
+        VideoView(lk, cam, Modifier.fillMaxSize(), onReady = { renderer = it })
         Column(Modifier.align(Alignment.TopStart).statusBarsPadding().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("$status • 👁 $viewers", color = Color.White,
-                modifier = Modifier.background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
+                modifier = Modifier.clickable { showViewers = true }
+                    .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
+            if (showViewers) ViewerListDialog(
+                remember(viewers, showViewers) { viewerNames(lk) }) { showViewers = false }
             if (!live) OutlinedTextField(title, { title = it }, label = { Text("Title") }, singleLine = true)
         }
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {

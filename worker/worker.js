@@ -40,7 +40,7 @@ export default {
             let m = {};
             try { m = JSON.parse(r.metadata || '{}'); } catch {}
             const n = r.numParticipants ?? r.num_participants ?? 1;
-            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1) };
+            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '' };
           });
         return json(out);
       }
@@ -54,6 +54,21 @@ export default {
         const token = await sign(env, { sub: 'host-' + id, name: h,
           video: { room: id, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
         return json({ id, url: env.LK_WS, token });
+      }
+      const mt = u.pathname.match(/^\/rooms\/([\w-]+)\/thumb$/);
+      if (req.method === 'POST' && mt) {
+        const id = mt[1];
+        const { thumb } = await req.json();
+        if (typeof thumb !== 'string' || thumb.length > 40000) return json({ error: 'bad thumb' }, 400);
+        const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [id] });
+        const r = (d.rooms || [])[0];
+        if (!r) return json({ error: 'no room' }, 404);
+        let m = {};
+        try { m = JSON.parse(r.metadata || '{}'); } catch {}
+        m.thumb = thumb;
+        await twirp(env, 'UpdateRoomMetadata', { roomAdmin: true, room: id },
+          { room: id, metadata: JSON.stringify(m) });
+        return json({ ok: true });
       }
       if (req.method === 'GET' && u.pathname === '/token') {
         const room = u.searchParams.get('room');
