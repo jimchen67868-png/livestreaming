@@ -25,6 +25,59 @@ async function twirp(env, method, grant, payload) {
   if (!r.ok) throw new Error(method + ' failed: ' + r.status);
   return r.json();
 }
+
+// ---------- moderation ----------
+const parseMeta = (r) => { try { return JSON.parse(r.metadata || '{}'); } catch { return {}; } };
+async function getRoom(env, id) {
+  const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [id] });
+  return (d.rooms || [])[0];
+}
+const updateMeta = (env, id, m) =>
+  twirp(env, 'UpdateRoomMetadata', { roomAdmin: true, room: id }, { room: id, metadata: JSON.stringify(m) });
+async function sendData(env, room, identities, obj) {
+  const data = btoa(String.fromCharCode(...enc.encode(JSON.stringify(obj))));
+  await twirp(env, 'SendData', { roomAdmin: true, room }, { room, data, kind: 'RELIABLE', destination_identities: identities });
+}
+async function guestIdentity(env, room) {
+  const d = await twirp(env, 'ListParticipants', { roomAdmin: true, room }, { room });
+  const p = (d.participants || []).find((x) => String(x.identity).startsWith('guest-'));
+  return p ? p.identity : null;
+}
+// Returns 0..1 (higher = more explicit), or null if moderation is off / unavailable.
+async function nudityScore(env, b64) {
+  if (!env.SE_USER || !env.SE_SECRET || typeof b64 !== 'string' || !b64) return null;
+  try {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const form = new FormData();
+    form.append('media', new Blob([bytes], { type: 'image/jpeg' }), 'f.jpg');
+    form.append('models', 'nudity-2.1');
+    form.append('api_user', env.SE_USER);
+    form.append('api_secret', env.SE_SECRET);
+    const res = await fetch('https://api.sightengine.com/1.0/check.json', { method: 'POST', body: form });
+    const d = await res.json();
+    if (d.status !== 'success') return null;
+    const n = d.nudity || {};
+    return Math.max(n.sexual_activity || 0, n.sexual_display || 0, n.erotica || 0);
+  } catch { return null; }
+}
+// score >= 0.8, or a second offence: end it. Otherwise warn.
+async function flag(env, id, who, score, m) {
+  const key = who === 'guest' ? 'gs' : 'hs';
+  const strikes = m[key] || 0;
+  const target = who === 'guest' ? await guestIdentity(env, id) : 'host-' + id;
+  if (score >= 0.8 || strikes >= 1) {
+    if (target) await sendData(env, id, [target], { t: 'ended', why: 'policy' });
+    if (who === 'guest') { if (target) await twirp(env, 'RemoveParticipant', { roomAdmin: true, room: id }, { room: id, identity: target }); }
+    else await twirp(env, 'DeleteRoom', { roomCreate: true }, { room: id });
+    return 'ended';
+  }
+  m[key] = strikes + 1;
+  if (who === 'host') m.thumb = '';
+  await updateMeta(env, id, m);
+  if (target) await sendData(env, id, [target], { t: 'warn' });
+  return 'warned';
+}
+
 const json = (o, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 
@@ -58,17 +111,60 @@ export default {
       const mt = u.pathname.match(/^\/rooms\/([\w-]+)\/thumb$/);
       if (req.method === 'POST' && mt) {
         const id = mt[1];
-        const { thumb } = await req.json();
+        const { thumb, img } = await req.json();
         if (typeof thumb !== 'string' || thumb.length > 40000) return json({ error: 'bad thumb' }, 400);
-        const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [id] });
+        const r = await getRoom(env, id);
+        if (!r) return json({ error: 'no room' }, 404);
+        const m = parseMeta(r);
+        const score = await nudityScore(env, img);
+        if (score !== null && score >= 0.5) return json({ ok: true, action: await flag(env, id, 'host', score, m) });
+        m.thumb = thumb;
+        await updateMeta(env, id, m);
+        return json({ ok: true });
+      }
+      const mc = u.pathname.match(/^\/rooms\/([\w-]+)\/check$/);
+      if (req.method === 'POST' && mc) {
+        const id = mc[1];
+        const { img } = await req.json();
+        const r = await getRoom(env, id);
+        if (!r) return json({ error: 'no room' }, 404);
+        const score = await nudityScore(env, img);
+        if (score !== null && score >= 0.5) return json({ ok: true, action: await flag(env, id, 'guest', score, parseMeta(r)) });
+        return json({ ok: true });
+      }
+      const mi = u.pathname.match(/^\/rooms\/([\w-]+)\/invite$/);
+      if (req.method === 'POST' && mi) {
+        const to = mi[1];
+        const { room, name } = await req.json();
+        const from = String(room);
+        const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [from, to] });
+        const rf = (d.rooms || []).find((r) => r.name === from);
+        const rt = (d.rooms || []).find((r) => r.name === to);
+        if (!rf || !rt) return json({ error: 'room gone' }, 404);
+        let m = {};
+        try { m = JSON.parse(rf.metadata || '{}'); } catch {}
+        m.invited = to;
+        await twirp(env, 'UpdateRoomMetadata', { roomAdmin: true, room: from },
+          { room: from, metadata: JSON.stringify(m) });
+        const msg = JSON.stringify({ t: 'pk_invite', room: from, name: String(name || 'host').slice(0, 20) });
+        const data = btoa(String.fromCharCode(...enc.encode(msg)));
+        await twirp(env, 'SendData', { roomAdmin: true, room: to },
+          { room: to, data, kind: 'RELIABLE', destination_identities: ['host-' + to] });
+        return json({ ok: true });
+      }
+      if (req.method === 'GET' && u.pathname === '/guest') {
+        const room = u.searchParams.get('room');
+        const from = u.searchParams.get('from');
+        const name = (u.searchParams.get('user') || 'guest').slice(0, 20);
+        const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [room] });
         const r = (d.rooms || [])[0];
         if (!r) return json({ error: 'no room' }, 404);
         let m = {};
         try { m = JSON.parse(r.metadata || '{}'); } catch {}
-        m.thumb = thumb;
-        await twirp(env, 'UpdateRoomMetadata', { roomAdmin: true, room: id },
-          { room: id, metadata: JSON.stringify(m) });
-        return json({ ok: true });
+        if (!from || m.invited !== from) return json({ error: 'not invited' }, 403);
+        const token = await sign(env, { sub: 'guest-' + crypto.randomUUID().slice(0, 8), name,
+          video: { room, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
+        return json({ url: env.LK_WS, token });
       }
       if (req.method === 'GET' && u.pathname === '/token') {
         const room = u.searchParams.get('room');
