@@ -506,6 +506,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var showPick by remember { mutableStateOf(false) }
     var invite by remember { mutableStateOf<Pair<String, String>?>(null) }
     var notice by remember { mutableStateOf("") }
+    var held by remember { mutableStateOf<Bitmap?>(null) }
 
     fun startPk() { scoreL = 0; scoreR = 0; pkLeft = 180; pkActive = true; result = "" }
     fun endPk() {
@@ -596,9 +597,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
 
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
     val owner = LocalLifecycleOwner.current
-    DisposableEffect(owner, live) {
+    DisposableEffect(owner, live, held) {
         val obs = LifecycleEventObserver { _, ev ->
-            if (ev == Lifecycle.Event.ON_RESUME && live) scope.launch {
+            if (ev == Lifecycle.Event.ON_RESUME && live && held == null) scope.launch {
                 try {
                     lk.localParticipant.setCameraEnabled(false)
                     lk.localParticipant.setCameraEnabled(true)
@@ -615,25 +616,41 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             var lastCheck = 0L
             var lastThumb = 0L
             while (true) {
-                val frame = renderer?.let { captureFrame(it) }
-                if (frame != null) {
-                    val now = System.currentTimeMillis()
-                    // 1) local check (free, every 5 s)
-                    val suspicious = withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }
-                    var clean = !suspicious
-                    // 2) only if flagged locally: server double-checks (at most every 30 s)
-                    if (suspicious && now - lastCheck > 30000) {
+                val now = System.currentTimeMillis()
+                val h = held
+                if (h != null) {
+                    // blocked on this phone: once the server may check, verify the held frame
+                    if (notice.isEmpty()) notice = "⚠️ Video blocked while it is checked."
+                    if (now - lastCheck > 30000) {
                         lastCheck = now
-                        val img = jpegB64(frame, 75)
-                        clean = withContext(Dispatchers.IO) {
+                        val img = jpegB64(h, 75)
+                        val clean = withContext(Dispatchers.IO) {
                             try { Api.checkFrame(server, roomId, img, "host", hostKey) } catch (e: Exception) { false }
                         }
+                        if (clean) {
+                            held = null; notice = ""
+                            try {
+                                lk.localParticipant.setCameraEnabled(true)
+                                cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                            } catch (e: Exception) { status = "Camera error: ${e.message}" }
+                        }
+                        // not clean: the server ends the live and the "ended" message does the rest
                     }
-                    if (clean && now - lastThumb > 30000) {
-                        lastThumb = now
-                        val t = squareThumb(frame)
-                        withContext(Dispatchers.IO) {
-                            try { Api.setThumb(server, roomId, t, hostKey) } catch (e: Exception) {}
+                } else {
+                    val frame = renderer?.let { captureFrame(it) }
+                    if (frame != null) {
+                        if (withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
+                            // local detection: block the video on this phone right away
+                            held = frame
+                            notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
+                            try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
+                            cam = null
+                        } else if (now - lastThumb > 30000) {
+                            lastThumb = now
+                            val t = squareThumb(frame)
+                            withContext(Dispatchers.IO) {
+                                try { Api.setThumb(server, roomId, t, hostKey) } catch (e: Exception) {}
+                            }
                         }
                     }
                 }
@@ -727,6 +744,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
     var myRenderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var gKey by remember { mutableStateOf("") }
     var notice by remember { mutableStateOf("") }
+    var held by remember { mutableStateOf<Bitmap?>(null) }
 
     LaunchedEffect(Unit) {
         try {
@@ -772,22 +790,39 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
     }
     LaunchedEffect(result) { if (result.isNotEmpty()) { delay(8000); onBack() } }
     LaunchedEffect(notice) { if (notice.isNotEmpty()) { delay(12000); notice = "" } }
-    LaunchedEffect(cam) {
-        if (cam != null) {
-            delay(3000)
-            var lastCheck = 0L
-            while (true) {
-                val frame = myRenderer?.let { captureFrame(it) }
-                if (frame != null && System.currentTimeMillis() - lastCheck > 30000 &&
-                    withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
-                    lastCheck = System.currentTimeMillis()
-                    val img = jpegB64(frame, 75)
-                    withContext(Dispatchers.IO) {
-                        try { Api.checkFrame(server, room, img, "guest", gKey) } catch (e: Exception) {}
+    LaunchedEffect(Unit) {
+        while (cam == null) delay(500)
+        delay(3000)
+        var lastCheck = 0L
+        while (true) {
+            val now = System.currentTimeMillis()
+            val h = held
+            if (h != null) {
+                if (notice.isEmpty()) notice = "⚠️ Video blocked while it is checked."
+                if (now - lastCheck > 30000) {
+                    lastCheck = now
+                    val img = jpegB64(h, 75)
+                    val clean = withContext(Dispatchers.IO) {
+                        try { Api.checkFrame(server, room, img, "guest", gKey) } catch (e: Exception) { false }
+                    }
+                    if (clean) {
+                        held = null; notice = ""
+                        try {
+                            lk.localParticipant.setCameraEnabled(true)
+                            cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                        } catch (e: Exception) {}
                     }
                 }
-                delay(5000)
+            } else {
+                val frame = myRenderer?.let { captureFrame(it) }
+                if (frame != null && withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
+                    held = frame
+                    notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
+                    try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
+                    cam = null
+                }
             }
+            delay(5000)
         }
     }
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
