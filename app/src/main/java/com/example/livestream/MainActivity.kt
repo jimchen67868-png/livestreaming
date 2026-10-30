@@ -150,7 +150,7 @@ fun squareThumb(b: Bitmap, out: Int = 160): String {
  * so it is allowed to be crude (false alarms just cost one server check).
  */
 object LocalGuard {
-    private const val THRESHOLD = 0.22f   // raise to check less often, lower to be stricter
+    private const val THRESHOLD = 0.45f   // raise to check less often, lower to be stricter
 
     // Optional ML model (assets/nsfw.tflite). If it is missing, the skin-colour check below is used.
     private var interp: Interpreter? = null
@@ -181,13 +181,13 @@ object LocalGuard {
             buf.rewind()
             val out = Array(1) { FloatArray(5) }
             it.run(buf, out)
-            out[0][3] + out[0][1] + 0.5f * out[0][4]
+            out[0][3] + out[0][1] + 0.25f * out[0][4]
         } catch (e: Exception) { null }
     }
 
     fun suspicious(src: Bitmap): Boolean {
         val m = modelScore(src)
-        return if (m != null) m >= 0.4f else skinRatio(src) > THRESHOLD
+        return if (m != null) m >= 0.5f else skinRatio(src) > THRESHOLD
     }
 
     private fun isSkin(r: Int, g: Int, b: Int): Boolean {
