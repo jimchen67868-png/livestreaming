@@ -10,7 +10,7 @@ import org.json.JSONObject
 
 object Api {
     data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "")
-    data class Join(val id: String, val url: String, val token: String)
+    data class Join(val id: String, val url: String, val token: String, val key: String = "")
 
     private val http = OkHttpClient()
 
@@ -34,27 +34,30 @@ object Api {
         val req = Request.Builder().url("${base(server)}/rooms").post(body).build()
         return http.newCall(req).execute().use { r ->
             val o = JSONObject(r.body!!.string())
-            Join(o.getString("id"), o.getString("url"), o.getString("token"))
+            Join(o.getString("id"), o.getString("url"), o.getString("token"), o.optString("key"))
         }
     }
 
-    fun setThumb(server: String, id: String, thumb: String, img: String) {
-        val body = JSONObject().put("thumb", thumb).put("img", img).toString()
+    fun setThumb(server: String, id: String, thumb: String, key: String) {
+        val body = JSONObject().put("thumb", thumb).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/rooms/$id/thumb").header("X-Key", key).post(body).build())
+            .execute().close()
+    }
+
+    /** Asks the server to double-check a frame the on-device detector flagged. true = server says clean. */
+    fun checkFrame(server: String, id: String, img: String, who: String, key: String): Boolean {
+        val body = JSONObject().put("img", img).put("who", who).toString()
             .toRequestBody("application/json".toMediaType())
-        http.newCall(Request.Builder().url("${base(server)}/rooms/$id/thumb").post(body).build())
-            .execute().close()
+        return http.newCall(Request.Builder().url("${base(server)}/rooms/$id/check").header("X-Key", key)
+            .post(body).build()).execute().use { r ->
+            try { JSONObject(r.body!!.string()).optBoolean("clean", false) } catch (e: Exception) { false }
+        }
     }
 
-    fun checkFrame(server: String, id: String, img: String) {
-        val body = JSONObject().put("img", img).toString().toRequestBody("application/json".toMediaType())
-        http.newCall(Request.Builder().url("${base(server)}/rooms/$id/check").post(body).build())
-            .execute().close()
-    }
-
-    fun invite(server: String, to: String, from: String, name: String) {
+    fun invite(server: String, to: String, from: String, name: String, key: String) {
         val body = JSONObject().put("room", from).put("name", name).toString()
             .toRequestBody("application/json".toMediaType())
-        http.newCall(Request.Builder().url("${base(server)}/rooms/$to/invite").post(body).build())
+        http.newCall(Request.Builder().url("${base(server)}/rooms/$to/invite").header("X-Key", key).post(body).build())
             .execute().close()
     }
 
@@ -63,7 +66,7 @@ object Api {
             .addQueryParameter("from", from).addQueryParameter("user", user).build()
         return http.newCall(Request.Builder().url(url).build()).execute().use { r ->
             val o = JSONObject(r.body!!.string())
-            Join(room, o.getString("url"), o.getString("token"))
+            Join(room, o.getString("url"), o.getString("token"), o.optString("key"))
         }
     }
 

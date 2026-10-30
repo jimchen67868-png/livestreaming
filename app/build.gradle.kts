@@ -19,6 +19,7 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    androidResources { noCompress += "tflite" }
     packaging {
         resources {
             excludes += setOf(
@@ -37,4 +38,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // Live video (WebRTC) via LiveKit Cloud
     implementation("io.livekit:livekit-android:2.26.1")
+    // On-device nudity detection
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 }

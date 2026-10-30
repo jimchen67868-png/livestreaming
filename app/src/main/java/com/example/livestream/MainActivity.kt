@@ -51,10 +51,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
+import org.tensorflow.lite.Interpreter
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        LocalGuard.load(applicationContext)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
     }
 }
@@ -121,17 +127,105 @@ fun remoteVideo(room: Room, guest: Boolean): VideoTrack? = room.remoteParticipan
     .filter { isGuest(it.identity?.value) == guest }
     .firstNotNullOfOrNull { it.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack }
 
-fun snapshot(v: TextureViewRenderer, out: Int = 160, quality: Int = 60): String? {
-    try {
-        if (v.width == 0 || v.height == 0) return null
-        val h = (out.toFloat() * v.height / v.width).toInt().coerceAtLeast(1)
-        val full = v.getBitmap(out, h) ?: return null
-        val side = minOf(full.width, full.height)
-        val sq = Bitmap.createBitmap(full, (full.width - side) / 2, (full.height - side) / 2, side, side)
-        val bos = ByteArrayOutputStream()
-        Bitmap.createScaledBitmap(sq, out, out, true).compress(Bitmap.CompressFormat.JPEG, quality, bos)
-        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
-    } catch (e: Exception) { return null }
+fun captureFrame(v: TextureViewRenderer, w: Int = 384): Bitmap? = try {
+    if (v.width == 0 || v.height == 0) null
+    else v.getBitmap(w, (w.toFloat() * v.height / v.width).toInt().coerceAtLeast(1))
+} catch (e: Exception) { null }
+
+fun jpegB64(b: Bitmap, quality: Int): String {
+    val bos = ByteArrayOutputStream()
+    b.compress(Bitmap.CompressFormat.JPEG, quality, bos)
+    return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+}
+
+fun squareThumb(b: Bitmap, out: Int = 160): String {
+    val side = minOf(b.width, b.height)
+    val sq = Bitmap.createBitmap(b, (b.width - side) / 2, (b.height - side) / 2, side, side)
+    return jpegB64(Bitmap.createScaledBitmap(sq, out, out, true), 60)
+}
+
+/**
+ * Cheap on-device pre-filter: share of skin-coloured pixels outside detected faces.
+ * It only decides whether a frame is worth sending to the server for a real check,
+ * so it is allowed to be crude (false alarms just cost one server check).
+ */
+object LocalGuard {
+    private const val THRESHOLD = 0.22f   // raise to check less often, lower to be stricter
+
+    // Optional ML model (assets/nsfw.tflite). If it is missing, the skin-colour check below is used.
+    private var interp: Interpreter? = null
+
+    fun load(ctx: Context) {
+        if (interp != null) return
+        interp = try {
+            val fd = ctx.assets.openFd("nsfw.tflite")
+            Interpreter(FileInputStream(fd.fileDescriptor).channel
+                .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength))
+        } catch (e: Exception) { null }
+    }
+
+    // classes: drawings, hentai, neutral, porn, sexy
+    @Synchronized
+    private fun modelScore(src: Bitmap): Float? {
+        val it = interp ?: return null
+        return try {
+            val s = Bitmap.createScaledBitmap(src, 224, 224, true)
+            val px = IntArray(224 * 224)
+            s.getPixels(px, 0, 224, 0, 0, 224, 224)
+            val buf = ByteBuffer.allocateDirect(4 * 224 * 224 * 3).order(ByteOrder.nativeOrder())
+            for (p in px) {
+                buf.putFloat(((p shr 16) and 0xFF) / 255f)
+                buf.putFloat(((p shr 8) and 0xFF) / 255f)
+                buf.putFloat((p and 0xFF) / 255f)
+            }
+            buf.rewind()
+            val out = Array(1) { FloatArray(5) }
+            it.run(buf, out)
+            out[0][3] + out[0][1] + 0.5f * out[0][4]
+        } catch (e: Exception) { null }
+    }
+
+    fun suspicious(src: Bitmap): Boolean {
+        val m = modelScore(src)
+        return if (m != null) m >= 0.4f else skinRatio(src) > THRESHOLD
+    }
+
+    private fun isSkin(r: Int, g: Int, b: Int): Boolean {
+        val y = 0.299f * r + 0.587f * g + 0.114f * b
+        val cb = 128f - 0.168736f * r - 0.331264f * g + 0.5f * b
+        val cr = 128f + 0.5f * r - 0.418688f * g - 0.081312f * b
+        return y > 50f && cb in 77f..127f && cr in 133f..173f && r > g && r > b
+    }
+
+    fun skinRatio(src: Bitmap): Float {
+        val w = 128
+        val h = (w.toFloat() * src.height / src.width).toInt().coerceAtLeast(16)
+        val small = Bitmap.createScaledBitmap(src, w, h, true)
+        val faces = mutableListOf<android.graphics.RectF>()
+        try {
+            val b565 = small.copy(Bitmap.Config.RGB_565, false)
+            val found = arrayOfNulls<android.media.FaceDetector.Face>(4)
+            val n = android.media.FaceDetector(w, h, 4).findFaces(b565, found)
+            val pt = android.graphics.PointF()
+            for (i in 0 until n) {
+                val f = found[i] ?: continue
+                f.getMidPoint(pt)
+                val e = f.eyesDistance()
+                faces.add(android.graphics.RectF(pt.x - 1.8f * e, pt.y - 1.6f * e, pt.x + 1.8f * e, pt.y + 2.6f * e))
+            }
+        } catch (e: Exception) {}
+        val px = IntArray(w * h)
+        small.getPixels(px, 0, w, 0, 0, w, h)
+        var skin = 0
+        var total = 0
+        for (y in 0 until h) for (x in 0 until w) {
+            if (faces.any { it.contains(x.toFloat(), y.toFloat()) }) continue
+            total++
+            val c = px[y * w + x]
+            if (isSkin((c shr 16) and 255, (c shr 8) and 255, c and 255)) skin++
+        }
+        return if (total == 0) 0f else skin / total.toFloat()
+    }
 }
 
 fun decodeThumb(b64: String): ImageBitmap? = try {
@@ -399,6 +493,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var showViewers by remember { mutableStateOf(false) }
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var roomId by remember { mutableStateOf("") }
+    var hostKey by remember { mutableStateOf("") }
     val msgs = remember { mutableStateListOf<String>() }
     // PK
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
@@ -479,6 +574,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 status = "Starting…"
                 val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user) }
                 roomId = j.id
+                hostKey = j.key
                 lk.connect(j.url, j.token)
                 lk.localParticipant.setCameraEnabled(true)
                 lk.localParticipant.setMicrophoneEnabled(true)
@@ -516,14 +612,32 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     LaunchedEffect(live) {
         if (live) {
             delay(3000)
+            var lastCheck = 0L
+            var lastThumb = 0L
             while (true) {
-                val r = renderer
-                val thumb = r?.let { snapshot(it) }
-                val img = r?.let { snapshot(it, 384, 75) }
-                if (thumb != null && img != null) withContext(Dispatchers.IO) {
-                    try { Api.setThumb(server, roomId, thumb, img) } catch (e: Exception) {}
+                val frame = renderer?.let { captureFrame(it) }
+                if (frame != null) {
+                    val now = System.currentTimeMillis()
+                    // 1) local check (free, every 5 s)
+                    val suspicious = withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }
+                    var clean = !suspicious
+                    // 2) only if flagged locally: server double-checks (at most every 30 s)
+                    if (suspicious && now - lastCheck > 30000) {
+                        lastCheck = now
+                        val img = jpegB64(frame, 75)
+                        clean = withContext(Dispatchers.IO) {
+                            try { Api.checkFrame(server, roomId, img, "host", hostKey) } catch (e: Exception) { false }
+                        }
+                    }
+                    if (clean && now - lastThumb > 30000) {
+                        lastThumb = now
+                        val t = squareThumb(frame)
+                        withContext(Dispatchers.IO) {
+                            try { Api.setThumb(server, roomId, t, hostKey) } catch (e: Exception) {}
+                        }
+                    }
                 }
-                delay(30000)
+                delay(5000)
             }
         }
     }
@@ -564,7 +678,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                                 showPick = false
                                 scope.launch {
                                     try {
-                                        withContext(Dispatchers.IO) { Api.invite(server, s.id, roomId, user) }
+                                        withContext(Dispatchers.IO) { Api.invite(server, s.id, roomId, user, hostKey) }
                                         status = "Invite sent to ${s.host}"
                                     } catch (e: Exception) { status = "Invite failed" }
                                 }
@@ -611,11 +725,13 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
     var result by remember { mutableStateOf("") }
     var hostName by remember { mutableStateOf("Host") }
     var myRenderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
+    var gKey by remember { mutableStateOf("") }
     var notice by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         try {
             val j = withContext(Dispatchers.IO) { Api.guestToken(server, room, from, user) }
+            gKey = j.key
             launch {
                 lk.events.collect { e ->
                     when (e) {
@@ -659,12 +775,18 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
     LaunchedEffect(cam) {
         if (cam != null) {
             delay(3000)
+            var lastCheck = 0L
             while (true) {
-                val img = myRenderer?.let { snapshot(it, 384, 75) }
-                if (img != null) withContext(Dispatchers.IO) {
-                    try { Api.checkFrame(server, room, img) } catch (e: Exception) {}
+                val frame = myRenderer?.let { captureFrame(it) }
+                if (frame != null && System.currentTimeMillis() - lastCheck > 30000 &&
+                    withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
+                    lastCheck = System.currentTimeMillis()
+                    val img = jpegB64(frame, 75)
+                    withContext(Dispatchers.IO) {
+                        try { Api.checkFrame(server, room, img, "guest", gKey) } catch (e: Exception) {}
+                    }
                 }
-                delay(30000)
+                delay(5000)
             }
         }
     }

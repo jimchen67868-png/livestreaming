@@ -78,6 +78,13 @@ async function flag(env, id, who, score, m) {
   return 'warned';
 }
 
+const hmac = async (env, msg) => {
+  const key = await crypto.subtle.importKey('raw', enc.encode(env.LK_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return b64u(await crypto.subtle.sign('HMAC', key, enc.encode(msg)));
+};
+const authed = async (req, env, scope, id) => req.headers.get('X-Key') === (await hmac(env, scope + ':' + id));
+
 const json = (o, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 
@@ -106,37 +113,41 @@ export default {
           { name: id, metadata: JSON.stringify({ title: t, host: h }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
           video: { room: id, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
-        return json({ id, url: env.LK_WS, token });
+        return json({ id, url: env.LK_WS, token, key: await hmac(env, 'host:' + id) });
       }
       const mt = u.pathname.match(/^\/rooms\/([\w-]+)\/thumb$/);
       if (req.method === 'POST' && mt) {
         const id = mt[1];
-        const { thumb, img } = await req.json();
+        if (!(await authed(req, env, 'host', id))) return json({ error: 'forbidden' }, 403);
+        const { thumb } = await req.json();
         if (typeof thumb !== 'string' || thumb.length > 40000) return json({ error: 'bad thumb' }, 400);
         const r = await getRoom(env, id);
         if (!r) return json({ error: 'no room' }, 404);
         const m = parseMeta(r);
-        const score = await nudityScore(env, img);
-        if (score !== null && score >= 0.5) return json({ ok: true, action: await flag(env, id, 'host', score, m) });
         m.thumb = thumb;
         await updateMeta(env, id, m);
         return json({ ok: true });
       }
+      // Local detector flagged a frame: confirm with Sightengine.
       const mc = u.pathname.match(/^\/rooms\/([\w-]+)\/check$/);
       if (req.method === 'POST' && mc) {
         const id = mc[1];
-        const { img } = await req.json();
+        const { img, who } = await req.json();
+        const role = who === 'guest' ? 'guest' : 'host';
+        if (!(await authed(req, env, role, id))) return json({ error: 'forbidden' }, 403);
         const r = await getRoom(env, id);
         if (!r) return json({ error: 'no room' }, 404);
         const score = await nudityScore(env, img);
-        if (score !== null && score >= 0.5) return json({ ok: true, action: await flag(env, id, 'guest', score, parseMeta(r)) });
-        return json({ ok: true });
+        if (score !== null && score >= 0.5)
+          return json({ ok: true, clean: false, action: await flag(env, id, role, score, parseMeta(r)) });
+        return json({ ok: true, clean: true });
       }
       const mi = u.pathname.match(/^\/rooms\/([\w-]+)\/invite$/);
       if (req.method === 'POST' && mi) {
         const to = mi[1];
         const { room, name } = await req.json();
         const from = String(room);
+        if (!(await authed(req, env, 'host', from))) return json({ error: 'forbidden' }, 403);
         const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [from, to] });
         const rf = (d.rooms || []).find((r) => r.name === from);
         const rt = (d.rooms || []).find((r) => r.name === to);
@@ -164,7 +175,7 @@ export default {
         if (!from || m.invited !== from) return json({ error: 'not invited' }, 403);
         const token = await sign(env, { sub: 'guest-' + crypto.randomUUID().slice(0, 8), name,
           video: { room, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
-        return json({ url: env.LK_WS, token });
+        return json({ url: env.LK_WS, token, key: await hmac(env, 'guest:' + room) });
       }
       if (req.method === 'GET' && u.pathname === '/token') {
         const room = u.searchParams.get('room');
