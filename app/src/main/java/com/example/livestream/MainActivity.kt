@@ -10,7 +10,10 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -64,8 +67,24 @@ import java.nio.channels.FileChannel
 import org.tensorflow.lite.Interpreter
 
 class MainActivity : ComponentActivity() {
+    private fun note(key: String, v: String) {
+        getSharedPreferences("diag", 0).edit().putString(key, v).commit()
+    }
+    private fun now() = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+
+    override fun onDestroy() {
+        note("destroy", now() + " changing=" + isChangingConfigurations + " finishing=" + isFinishing)
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val old = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try { note("crash", now() + " " + e + " @ " + (e.stackTrace.firstOrNull()?.toString() ?: "")) } catch (x: Exception) {}
+            old?.uncaughtException(t, e)
+        }
+        note("create", now() + " restored=" + (savedInstanceState != null))
         LocalGuard.load(applicationContext)
         GenderGuard.load(applicationContext)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
@@ -380,6 +399,15 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             w.settings.domStorageEnabled = true
             w.settings.mediaPlaybackRequiresUserGesture = false
             w.webChromeClient = WebChromeClient()
+            w.webViewClient = object : WebViewClient() {
+                override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
+                    val h = req.url.host ?: ""
+                    if (req.isForMainFrame || h.contains("youtube") || h.contains("google") || h.contains("ytimg")) {
+                        val d = err.description.toString().replace("'", " ")
+                        view.evaluateJavascript("msg('Load error: " + d + " (" + h + ")')", null)
+                    }
+                }
+            }
             w.setBackgroundColor(android.graphics.Color.BLACK)
             val html = YT_HTML.replace("__PE__", if (host) "auto" else "none").replace("__CT__", if (host) "1" else "0")
             w.loadDataWithBaseURL("https://yt.livestream-app.com/", html, "text/html", "utf-8", null)
@@ -402,6 +430,33 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         }
     }
     DisposableEffect(web) { onDispose { try { web?.destroy() } catch (e: Exception) {} } }
+}
+
+const val BUILD_TAG = "b6-diag"
+
+fun exitName(r: Int) = when (r) {
+    1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
+    7 -> "INIT_FAILURE"; 8 -> "PERMISSION_CHANGE"; 9 -> "EXCESSIVE_RESOURCE"; 10 -> "USER_REQUESTED"
+    11 -> "USER_STOPPED"; 12 -> "DEPENDENCY_DIED"; 13 -> "OTHER"; else -> "UNKNOWN($r)"
+}
+
+fun diagText(ctx: Context): String {
+    val d = ctx.getSharedPreferences("diag", 0)
+    val sb = StringBuilder("Build: $BUILD_TAG\n")
+    sb.append("create: ").append(d.getString("create", "-")).append("\n")
+    sb.append("destroy: ").append(d.getString("destroy", "-")).append("\n")
+    sb.append("crash: ").append(d.getString("crash", "none")).append("\n")
+    if (android.os.Build.VERSION.SDK_INT >= 30) {
+        try {
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            for (x in am.getHistoricalProcessExitReasons(ctx.packageName, 0, 4)) {
+                sb.append("exit: ").append(exitName(x.reason)).append(" ")
+                    .append(java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(x.timestamp)))
+                    .append(" ").append(x.description ?: "").append("\n")
+            }
+        } catch (e: Exception) {}
+    }
+    return sb.toString()
 }
 
 fun decodeThumb(b64: String): ImageBitmap? = try {
@@ -510,6 +565,7 @@ fun HomeScreen(
 ) {
     var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
+    var showDiag by remember { mutableStateOf(false) }
     val hctx = LocalContext.current
     val sorted = remember(streams) {
         streams.sortedWith(compareByDescending<Api.Stream> { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
@@ -524,7 +580,10 @@ fun HomeScreen(
         }
     }
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("Live now", style = MaterialTheme.typography.headlineSmall)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            TextButton({ showDiag = true }) { Text("ⓘ") }
+        }
         OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(user, { onSettings(server, it) }, label = { Text("Name") },
@@ -548,6 +607,12 @@ fun HomeScreen(
             }
         }
         Button(onGoLive, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) { Text("Go Live") }
+        if (showDiag) AlertDialog(
+            onDismissRequest = { showDiag = false },
+            title = { Text("Diagnostics") },
+            text = { Text(diagText(hctx), style = MaterialTheme.typography.bodySmall) },
+            confirmButton = { TextButton({ showDiag = false }) { Text("Close") } }
+        )
     }
 }
 
