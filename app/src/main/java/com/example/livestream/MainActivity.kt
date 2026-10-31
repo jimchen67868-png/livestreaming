@@ -9,11 +9,11 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Bundle
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.PlayerConstants
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.YouTubePlayer
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.listeners.AbstractYouTubePlayerListener
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.options.IFramePlayerOptions
+import com.pierfrancescosoffritti.androidyoutubeplayer.core.player.views.YouTubePlayerView
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -359,97 +359,84 @@ fun youtubeId(s: String): String? {
     return Regex("(?:v=|youtu\\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})").find(t)?.groupValues?.get(1)
 }
 
-private const val YT_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}body{pointer-events:__PE__}</style></head>
-<body><div id="p"></div><div id="msg" style="position:absolute;left:0;right:0;top:45%;text-align:center;color:#fff;font:14px sans-serif;padding:8px"></div>
-<script>
-function msg(t){document.getElementById('msg').textContent=t;try{AndroidYt.status(t);}catch(e){}}
-msg('Loading YouTube…');
-var player=null,ready=false,pending=null;
-var s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';s.onerror=function(){msg('Cannot reach YouTube. Check the internet.');};document.head.appendChild(s);
-function onYouTubeIframeAPIReady(){
-  player=new YT.Player('p',{host:'https://www.youtube-nocookie.com',width:'100%',height:'100%',
-    playerVars:{playsinline:1,controls:__CT__,rel:0,modestbranding:1,fs:0,origin:location.origin,widget_referrer:location.href},
-    events:{onReady:function(){ready=true;msg('');if(pending){var c=pending;pending=null;apply(c);}},
-      onStateChange:function(e){if(e.data===1){msg('');}},
-      onError:function(e){msg('YouTube cannot play this video here (error '+e.data+')');}}});
-}
-function apply(c){
-  if(!ready){pending=c;return;}
-  var cur='';try{cur=player.getVideoData().video_id||'';}catch(e){}
-  if(c.id!==cur){player.loadVideoById(c.id,c.pos||0);if(!c.play){setTimeout(function(){player.pauseVideo();},800);}return;}
-  var st=player.getPlayerState();
-  if(c.play&&st!==1&&st!==3){player.playVideo();}
-  if(!c.play&&st===1){player.pauseVideo();}
-  if(Math.abs(player.getCurrentTime()-(c.pos||0))>3){player.seekTo(c.pos||0,true);}
-}
-function state(){
-  if(!ready)return null;
-  try{return {id:player.getVideoData().video_id||'',play:player.getPlayerState()===1,pos:player.getCurrentTime()};}catch(e){return null;}
-}
-</script></body></html>"""
-
-class YtBridge(private val onStatus: (String) -> Unit) {
-    @android.webkit.JavascriptInterface
-    fun status(s: String) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post { onStatus(s) }
-    }
-}
-
-// Host: has controls and reports its state every 2 s. Viewer: no controls, follows `cmd`.
+// Host: has the player controls and reports id / play state / position every 2 s.
+// Viewer: no controls, follows the host's latest message (`cmd`).
 @Composable
 fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JSONObject) -> Unit = {}) {
-    var web by remember { mutableStateOf<WebView?>(null) }
-    val latest by rememberUpdatedState(cmd)
+    val ctx = LocalContext.current
     var st by remember { mutableStateOf("Starting player…") }
-    Box(modifier) {
-    AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
-        WebView(c).also { w ->
-            w.addJavascriptInterface(YtBridge { st = it }, "AndroidYt")
-            w.settings.javaScriptEnabled = true
-            w.settings.domStorageEnabled = true
-            w.settings.mediaPlaybackRequiresUserGesture = false
-            w.webChromeClient = WebChromeClient()
-            w.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) { st = "Page loading…" }
-                override fun onPageFinished(view: WebView?, url: String?) { if (st == "Page loading…") st = "Page loaded, waiting for YouTube…" }
-                override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
-                    val h = req.url.host ?: ""
-                    if (req.isForMainFrame || h.contains("youtube") || h.contains("google") || h.contains("ytimg")) {
-                        val d = err.description.toString().replace("'", " ")
-                        st = "Load error: " + d + " (" + h + ")"
-                        view.evaluateJavascript("msg('Load error: " + d + " (" + h + ")')", null)
-                    }
-                }
-            }
-            w.setBackgroundColor(android.graphics.Color.BLACK)
-            val html = YT_HTML.replace("__PE__", if (host) "auto" else "none").replace("__CT__", if (host) "1" else "0")
-            w.loadDataWithBaseURL("https://yt.livestream-app.com/", html, "text/html", "utf-8", null)
-            web = w
+    val player = remember { arrayOfNulls<YouTubePlayer>(1) }
+    val view = remember { arrayOfNulls<YouTubePlayerView>(1) }
+    val pos = remember { doubleArrayOf(0.0) }
+    val playing = remember { booleanArrayOf(false) }
+    val vid = remember { arrayOf("") }
+    val latest by rememberUpdatedState(cmd)
+
+    fun applyCmd(c: JSONObject) {
+        val p = player[0] ?: return
+        val id = c.optString("id")
+        if (id.isEmpty()) return
+        val want = c.optDouble("pos", 0.0).toFloat()
+        val play = c.optBoolean("play", true)
+        if (id != vid[0]) {
+            vid[0] = id
+            p.loadVideo(id, want)
+            if (!play) p.pause()
+            return
         }
-    })
-    if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
-        modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
+        if (play && !playing[0]) p.play()
+        if (!play && playing[0]) p.pause()
+        if (Math.abs(pos[0] - want) > 3.0) p.seekTo(want)
     }
-    LaunchedEffect(cmd, web) {
-        if (cmd != null) web?.evaluateJavascript("apply(" + cmd.toString() + ")", null)
+
+    val listener = remember {
+        object : AbstractYouTubePlayerListener() {
+            override fun onReady(youTubePlayer: YouTubePlayer) {
+                player[0] = youTubePlayer
+                st = ""
+                latest?.let { applyCmd(it) }
+            }
+            override fun onStateChange(youTubePlayer: YouTubePlayer, state: PlayerConstants.PlayerState) {
+                playing[0] = state == PlayerConstants.PlayerState.PLAYING
+                if (playing[0]) st = ""
+            }
+            override fun onCurrentSecond(youTubePlayer: YouTubePlayer, second: Float) { pos[0] = second.toDouble() }
+            override fun onVideoId(youTubePlayer: YouTubePlayer, videoId: String) { vid[0] = videoId }
+            override fun onError(youTubePlayer: YouTubePlayer, error: PlayerConstants.PlayerError) {
+                st = "YouTube cannot play this video here ($error)"
+            }
+        }
     }
-    LaunchedEffect(web, host) {
-        var loaded = false
+
+    Box(modifier.background(Color.Black)) {
+        AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
+            YouTubePlayerView(c).also { v ->
+                v.enableAutomaticInitialization = false
+                v.initialize(listener, true, IFramePlayerOptions.Builder().controls(if (host) 1 else 0).build())
+                view[0] = v
+            }
+        })
+        if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
+        TextButton({
+            val id = if (vid[0].isNotEmpty()) vid[0] else latest?.optString("id") ?: ""
+            if (id.isNotEmpty()) try {
+                ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://youtu.be/" + id)))
+            } catch (e: Exception) {}
+        }, Modifier.align(Alignment.BottomStart)) { Text("Open in YouTube", style = MaterialTheme.typography.bodySmall) }
+    }
+
+    LaunchedEffect(cmd) { if (cmd != null) applyCmd(cmd) }
+    LaunchedEffect(host) {
         if (host) while (true) {
-            delay(if (loaded) 2000 else 700)
-            web?.evaluateJavascript("state()") { r ->
-                var hs: JSONObject? = null
-                try { if (r != null && r != "null") hs = JSONObject(r) } catch (e: Exception) {}
-                if (hs != null && hs.optString("id").isNotEmpty()) { loaded = true; onHostState(hs) }
-                else latest?.let { web?.evaluateJavascript("apply(" + it.toString() + ")", null) }
-            }
+            delay(2000)
+            if (vid[0].isNotEmpty()) onHostState(JSONObject().put("id", vid[0]).put("play", playing[0]).put("pos", pos[0]))
         }
     }
-    DisposableEffect(web) { val w = web; onDispose { try { w?.destroy() } catch (e: Exception) {} } }
+    DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b8-yt-status"
+const val BUILD_TAG = "b9-yt-lib"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
