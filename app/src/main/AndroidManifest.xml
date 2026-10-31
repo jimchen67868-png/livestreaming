@@ -29,6 +29,6 @@
         <service
             android:name=".LiveService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone|mediaProjection" />
     </application>
 </manifest>

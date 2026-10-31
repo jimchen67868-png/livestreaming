@@ -436,7 +436,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b11-yt-13"
+const val BUILD_TAG = "b12-share"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -782,6 +782,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         val data = res.data
         if (res.resultCode == Activity.RESULT_OK && data != null) scope.launch {
             try {
+                try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java).putExtra("share", true)) } catch (e: Exception) {}
+                delay(500)
                 lk.localParticipant.setScreenShareEnabled(true, ScreenCaptureParams(data))
                 sharing = true
             } catch (e: Exception) { status = "Share error: ${e.message}" }
@@ -1059,6 +1061,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     if (sharing) scope.launch {
                         try { lk.localParticipant.setScreenShareEnabled(false) } catch (e: Exception) {}
                         sharing = false
+                        try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
                     } else {
                         val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                         shareLauncher.launch(mpm.createScreenCaptureIntent())

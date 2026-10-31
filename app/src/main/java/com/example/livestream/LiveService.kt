@@ -31,8 +31,16 @@ class LiveService : Service() {
             .setContentIntent(open)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 30) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        else startForeground(1, n)
+        val share = intent?.getBooleanExtra("share", false) == true
+        if (Build.VERSION.SDK_INT >= 30) {
+            val mic = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            try {
+                // While sharing the screen, Android 14 needs a mediaProjection service running BEFORE the capture starts.
+                startForeground(1, n, if (share) mic or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else mic)
+            } catch (e: Exception) {
+                startForeground(1, n, mic)
+            }
+        } else startForeground(1, n)
         return START_NOT_STICKY
     }
 }
