@@ -379,6 +379,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
 
     val lastSeek = remember { longArrayOf(0L) }
     val rate = remember { doubleArrayOf(1.0) }
+    val pendingPause = remember { booleanArrayOf(false) }
 
     fun applyCmd(c: JSONObject) {
         val p = player[0] ?: return
@@ -395,7 +396,8 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             // a new video needs ~1 s to start, so start a bit ahead
             p.loadVideo(id, (want + (if (play) 0.8 else 0.0)).toFloat())
             lastSeek[0] = System.currentTimeMillis()
-            if (!play) p.pause()
+            // host is paused: let the first picture appear, THEN pause (pausing too early leaves a black screen)
+            pendingPause[0] = !play
             return
         }
         if (play && !playing[0]) p.play()
@@ -421,7 +423,10 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             }
             override fun onStateChange(youTubePlayer: YouTubePlayer, state: PlayerConstants.PlayerState) {
                 playing[0] = state == PlayerConstants.PlayerState.PLAYING
-                if (playing[0]) st = ""
+                if (playing[0]) {
+                    st = ""
+                    if (pendingPause[0]) { pendingPause[0] = false; youTubePlayer.pause() }
+                }
             }
             override fun onCurrentSecond(youTubePlayer: YouTubePlayer, second: Float) { pos[0] = second.toDouble() }
             override fun onVideoId(youTubePlayer: YouTubePlayer, videoId: String) { vid[0] = videoId }
@@ -460,7 +465,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b17-yt-rate"
+const val BUILD_TAG = "b18-yt-join"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
