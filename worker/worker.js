@@ -131,7 +131,7 @@ export default {
         if (!r) return json({ error: 'no room' }, 404);
         const m = parseMeta(r);
         m.thumb = thumb;
-        if (['talk', 'group', 'scene', 'pk'].includes(type)) m.type = type;
+        if (['talk', 'group', 'scene', 'pk', 'screen'].includes(type)) m.type = type;
         await updateMeta(env, id, m);
         return json({ ok: true });
       }

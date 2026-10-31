@@ -1,6 +1,8 @@
 package com.example.livestream
 
 import android.Manifest
+import android.app.Activity
+import android.media.projection.MediaProjectionManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -44,6 +46,7 @@ import io.livekit.android.renderer.TextureViewRenderer
 import io.livekit.android.room.Room
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
+import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import io.livekit.android.room.track.VideoTrack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -309,12 +312,12 @@ object LiveType {
         if (faces == 0) "scene" else if (faces == 1) "talk" else "group"
     } catch (e: Exception) { "" }
 
-    fun icon(t: String) = when (t) { "talk" -> "💬 "; "group" -> "👥 "; "scene" -> "🎬 "; "pk" -> "⚔️ "; else -> "" }
+    fun icon(t: String) = when (t) { "talk" -> "💬 "; "group" -> "👥 "; "scene" -> "🎬 "; "pk" -> "⚔️ "; "screen" -> "🖥 "; else -> "" }
 }
 
 // What this viewer watches: +1 per 30 s visit, older visits fade (x0.95 each time).
 object Pref {
-    private val types = listOf("talk", "group", "scene", "pk")
+    private val types = listOf("talk", "group", "scene", "pk", "screen")
     fun score(ctx: Context, t: String): Float =
         if (t.isEmpty()) 0f else ctx.getSharedPreferences("s", 0).getFloat("pref_$t", 0f)
 
@@ -483,6 +486,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     val msgs = remember { mutableStateListOf<String>() }
     var viewers by remember { mutableIntStateOf(0) }
     var hostV by remember { mutableStateOf<VideoTrack?>(null) }
+    var screenV by remember { mutableStateOf<VideoTrack?>(null) }
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
@@ -503,11 +507,13 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                             if (t != null) {
                                 if (isGuest(e.participant.identity?.value)) {
                                     guestV = t; guestName = e.participant.name ?: "Guest"
-                                } else hostV = t
+                                } else if (e.publication.source == Track.Source.SCREEN_SHARE) screenV = t
+                                else hostV = t
                             }
                         }
                         is RoomEvent.TrackUnsubscribed -> {
                             if (isGuest(e.participant.identity?.value)) guestV = null
+                            else if (e.publication.source == Track.Source.SCREEN_SHARE) screenV = null
                         }
                         is RoomEvent.DataReceived -> {
                             val o = parseJson(e.data)
@@ -538,6 +544,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             viewers = viewerCount(lk)
             hostV = remoteVideo(lk, false)
             guestV = remoteVideo(lk, true)
+            screenV = lk.remoteParticipants.values.filter { !isGuest(it.identity?.value) }
+                .firstNotNullOfOrNull { it.getTrackPublication(Track.Source.SCREEN_SHARE)?.track as? VideoTrack }
             status = ""
         } catch (e: Exception) { status = "Error: ${e.message}" }
     }
@@ -548,7 +556,11 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
-            VideoView(lk, hostV, Modifier.weight(1f).fillMaxHeight())
+            Box(Modifier.weight(1f).fillMaxHeight()) {
+                VideoView(lk, screenV ?: hostV, Modifier.fillMaxSize())
+                if (screenV != null && hostV != null) VideoView(lk, hostV,
+                    Modifier.align(Alignment.BottomEnd).padding(8.dp).size(84.dp, 120.dp))
+            }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
@@ -611,6 +623,16 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var invite by remember { mutableStateOf<Pair<String, String>?>(null) }
     var notice by remember { mutableStateOf("") }
     var held by remember { mutableStateOf<Bitmap?>(null) }
+    var sharing by remember { mutableStateOf(false) }
+    val shareLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        val data = res.data
+        if (res.resultCode == Activity.RESULT_OK && data != null) scope.launch {
+            try {
+                lk.localParticipant.setScreenShareEnabled(true, ScreenCaptureParams(data))
+                sharing = true
+            } catch (e: Exception) { status = "Share error: ${e.message}" }
+        }
+    }
 
     fun startPk() { scoreL = 0; scoreR = 0; pkLeft = 180; pkActive = true; result = "" }
     fun endPk() {
@@ -671,7 +693,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     LaunchedEffect(notice) { if (notice.isNotEmpty()) { delay(12000); notice = "" } }
 
     fun stop() {
-        lk.disconnect(); live = false; cam = null; status = "Ended"
+        lk.disconnect(); live = false; cam = null; sharing = false; status = "Ended"
     }
     fun start() {
         scope.launch {
@@ -748,9 +770,10 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                             // local detection: block the video on this phone right away
                             held = frame
                             notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
+                            if (sharing) { try { lk.localParticipant.setScreenShareEnabled(false) } catch (e: Exception) {}; sharing = false }
                             try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
                             cam = null
-                        } else if (withContext(Dispatchers.Default) { GenderGuard.mixed(frame) }) {
+                        } else if (!sharing && withContext(Dispatchers.Default) { GenderGuard.mixed(frame) }) {
                             // rule: no man and woman together in one camera
                             mixedStrikes++
                             if (mixedStrikes >= 3) {
@@ -769,7 +792,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         } else if (now - lastThumb > 30000) {
                             lastThumb = now
                             val t = squareThumb(frame)
-                            val ty = if (pkActive) "pk" else withContext(Dispatchers.Default) { LiveType.detect(frame) }
+                            val ty = if (pkActive) "pk" else if (sharing) "screen" else withContext(Dispatchers.Default) { LiveType.detect(frame) }
                             withContext(Dispatchers.IO) {
                                 try { Api.setThumb(server, roomId, t, hostKey, ty) } catch (e: Exception) {}
                             }
@@ -844,6 +867,15 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
                 OutlinedButton({ showPick = true }, enabled = live && !pkActive) { Text("PK") }
+                OutlinedButton({
+                    if (sharing) scope.launch {
+                        try { lk.localParticipant.setScreenShareEnabled(false) } catch (e: Exception) {}
+                        sharing = false
+                    } else {
+                        val mpm = ctx.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                        shareLauncher.launch(mpm.createScreenCaptureIntent())
+                    }
+                }, enabled = live && !pkActive && held == null) { Text(if (sharing) "Unshare" else "Share") }
                 OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
             }
         }
