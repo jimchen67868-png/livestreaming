@@ -42,6 +42,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -457,14 +458,21 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         }
     }
 
-    Box(modifier.background(Color.Black)) {
-        AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
-            YouTubePlayerView(c).also { v ->
-                v.enableAutomaticInitialization = false
-                v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(if (host) 1 else 0).build())
-                view[0] = v
-            }
-        })
+    Box(modifier.background(Color.Black).clipToBounds()) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            // Viewers: the player is made taller and pushed up so YouTube's title / share strip falls outside the screen.
+            AndroidView(
+                modifier = if (host) Modifier.fillMaxSize()
+                else Modifier.requiredSize(maxWidth, maxHeight + 72.dp).offset(y = (-72).dp),
+                factory = { c ->
+                    YouTubePlayerView(c).also { v ->
+                        v.enableAutomaticInitialization = false
+                        v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(if (host) 1 else 0).build())
+                        view[0] = v
+                    }
+                }
+            )
+        }
         if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
         if (!host) TextButton({ ccOn = !ccOn; setCaptions(ccOn) }, Modifier.align(Alignment.BottomEnd)) {
@@ -488,7 +496,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b20-yt-cc2"
+const val BUILD_TAG = "b21-yt-crop"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
