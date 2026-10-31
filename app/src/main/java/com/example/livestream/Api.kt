@@ -9,7 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object Api {
-    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "", val cc: String = "", val same: Boolean = false)
+    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "", val cc: String = "", val same: Boolean = false, val kind: String = "")
     data class Join(val id: String, val url: String, val token: String, val key: String = "")
 
     private val http = OkHttpClient()
@@ -24,12 +24,12 @@ object Api {
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"), o.optString("type"), o.optString("cc"), o.optBoolean("same"))
+                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"), o.optString("type"), o.optString("cc"), o.optBoolean("same"), o.optString("kind"))
             }
         }
 
-    fun createRoom(server: String, title: String, user: String): Join {
-        val body = JSONObject().put("title", title).put("host", user).toString()
+    fun createRoom(server: String, title: String, user: String, kind: String = "live"): Join {
+        val body = JSONObject().put("title", title).put("host", user).put("kind", kind).toString()
             .toRequestBody("application/json".toMediaType())
         val req = Request.Builder().url("${base(server)}/rooms").post(body).build()
         return http.newCall(req).execute().use { r ->

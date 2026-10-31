@@ -106,19 +106,21 @@ export default {
             let m = {};
             try { m = JSON.parse(r.metadata || '{}'); } catch {}
             const n = r.numParticipants ?? r.num_participants ?? 1;
-            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '', type: m.type || '', cc: m.cc || '', same: !!m.cc && m.cc === ccOf(req) };
+            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '', type: m.kind === 'audio' ? 'audio' : (m.type || ''), kind: m.kind || 'live', cc: m.cc || '', same: !!m.cc && m.cc === ccOf(req) };
           });
         return json(out);
       }
       if (req.method === 'POST' && u.pathname === '/rooms') {
-        const { title, host } = await req.json();
+        const { title, host, kind } = await req.json();
+        const k = kind === 'audio' ? 'audio' : 'live';
         const id = crypto.randomUUID().slice(0, 8);
         const t = String(title || 'Live').slice(0, 60);
         const h = String(host || 'guest').slice(0, 20);
         await twirp(env, 'CreateRoom', { roomCreate: true },
-          { name: id, metadata: JSON.stringify({ title: t, host: h, cc: ccOf(req) }), empty_timeout: 30 });
+          { name: id, metadata: JSON.stringify({ title: t, host: h, kind: k, cc: ccOf(req) }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
-          video: { room: id, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
+          video: { room: id, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true,
+            canPublishSources: k === 'audio' ? ['microphone', 'screen_share', 'screen_share_audio'] : ['camera', 'microphone'] } });
         return json({ id, url: env.LK_WS, token, key: await hmac(env, 'host:' + id) });
       }
       const mt = u.pathname.match(/^\/rooms\/([\w-]+)\/thumb$/);

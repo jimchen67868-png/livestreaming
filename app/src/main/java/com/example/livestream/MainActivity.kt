@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Bundle
+import android.webkit.WebChromeClient
+import android.webkit.WebView
 import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -312,12 +314,12 @@ object LiveType {
         if (faces == 0) "scene" else if (faces == 1) "talk" else "group"
     } catch (e: Exception) { "" }
 
-    fun icon(t: String) = when (t) { "talk" -> "💬 "; "group" -> "👥 "; "scene" -> "🎬 "; "pk" -> "⚔️ "; "screen" -> "🖥 "; else -> "" }
+    fun icon(t: String) = when (t) { "talk" -> "💬 "; "group" -> "👥 "; "scene" -> "🎬 "; "pk" -> "⚔️ "; "screen" -> "🖥 "; "audio" -> "🎙 "; else -> "" }
 }
 
 // What this viewer watches: +1 per 30 s visit, older visits fade (x0.95 each time).
 object Pref {
-    private val types = listOf("talk", "group", "scene", "pk", "screen")
+    private val types = listOf("talk", "group", "scene", "pk", "screen", "audio")
     fun score(ctx: Context, t: String): Float =
         if (t.isEmpty()) 0f else ctx.getSharedPreferences("s", 0).getFloat("pref_$t", 0f)
 
@@ -328,6 +330,69 @@ object Pref {
         for (k in types) e.putFloat("pref_$k", sp.getFloat("pref_$k", 0f) * 0.95f + (if (k == t) 1f else 0f))
         e.apply()
     }
+}
+
+// ---------- YouTube synced player (audio rooms) ----------
+fun youtubeId(s: String): String? {
+    val t = s.trim()
+    if (Regex("^[A-Za-z0-9_-]{11}$").matches(t)) return t
+    return Regex("(?:v=|youtu\\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})").find(t)?.groupValues?.get(1)
+}
+
+private const val YT_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}body{pointer-events:__PE__}</style></head>
+<body><div id="p"></div>
+<script>
+var player=null,ready=false,pending=null;
+var s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
+function onYouTubeIframeAPIReady(){
+  player=new YT.Player('p',{host:'https://www.youtube-nocookie.com',width:'100%',height:'100%',
+    playerVars:{playsinline:1,controls:__CT__,rel:0,modestbranding:1,fs:0},
+    events:{onReady:function(){ready=true;if(pending){var c=pending;pending=null;apply(c);}}}});
+}
+function apply(c){
+  if(!ready){pending=c;return;}
+  var cur='';try{cur=player.getVideoData().video_id||'';}catch(e){}
+  if(c.id!==cur){player.loadVideoById(c.id,c.pos||0);if(!c.play){setTimeout(function(){player.pauseVideo();},800);}return;}
+  var st=player.getPlayerState();
+  if(c.play&&st!==1&&st!==3){player.playVideo();}
+  if(!c.play&&st===1){player.pauseVideo();}
+  if(Math.abs(player.getCurrentTime()-(c.pos||0))>3){player.seekTo(c.pos||0,true);}
+}
+function state(){
+  if(!ready)return null;
+  try{return {id:player.getVideoData().video_id||'',play:player.getPlayerState()===1,pos:player.getCurrentTime()};}catch(e){return null;}
+}
+</script></body></html>"""
+
+// Host: has controls and reports its state every 2 s. Viewer: no controls, follows `cmd`.
+@Composable
+fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JSONObject) -> Unit = {}) {
+    var web by remember { mutableStateOf<WebView?>(null) }
+    AndroidView(modifier = modifier, factory = { c ->
+        WebView(c).also { w ->
+            w.settings.javaScriptEnabled = true
+            w.settings.domStorageEnabled = true
+            w.settings.mediaPlaybackRequiresUserGesture = false
+            w.webChromeClient = WebChromeClient()
+            w.setBackgroundColor(android.graphics.Color.BLACK)
+            val html = YT_HTML.replace("__PE__", if (host) "auto" else "none").replace("__CT__", if (host) "1" else "0")
+            w.loadDataWithBaseURL("https://yt.livestream-app.com/", html, "text/html", "utf-8", null)
+            web = w
+        }
+    })
+    LaunchedEffect(cmd, web) {
+        if (cmd != null) web?.evaluateJavascript("apply(" + cmd.toString() + ")", null)
+    }
+    LaunchedEffect(web, host) {
+        if (host) while (true) {
+            delay(2000)
+            web?.evaluateJavascript("state()") { r ->
+                try { if (r != null && r != "null") onHostState(JSONObject(r)) } catch (e: Exception) {}
+            }
+        }
+    }
+    DisposableEffect(web) { onDispose { try { web?.destroy() } catch (e: Exception) {} } }
 }
 
 fun decodeThumb(b64: String): ImageBitmap? = try {
@@ -465,7 +530,7 @@ fun HomeScreen(
                     if (img != null) Image(img, null, Modifier.fillMaxWidth().aspectRatio(1f),
                         contentScale = ContentScale.Crop)
                     else Box(Modifier.fillMaxWidth().aspectRatio(1f).background(Color(0xFF333333)),
-                        contentAlignment = Alignment.Center) { Text("📺") }
+                        contentAlignment = Alignment.Center) { Text(if (r.kind == "audio") "🎙" else "📺") }
                     Column(Modifier.padding(10.dp)) {
                         Text(r.title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
                         Text("${flag(r.cc)}${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
@@ -487,6 +552,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     var viewers by remember { mutableIntStateOf(0) }
     var hostV by remember { mutableStateOf<VideoTrack?>(null) }
     var screenV by remember { mutableStateOf<VideoTrack?>(null) }
+    var yt by remember { mutableStateOf<JSONObject?>(null) }
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
@@ -526,6 +592,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                                     } else pk = listOf(o.optInt("l"), o.optInt("r"), o.optInt("left"))
                                 }
                                 "goto" -> if (fromHost) onSwitch(o.optString("room"))
+                                "yt" -> if (fromHost) yt = if (o.optString("id").isEmpty()) null else o
                             }
                         }
                         is RoomEvent.ParticipantConnected -> { viewers = viewerCount(lk) }
@@ -557,7 +624,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f).fillMaxHeight()) {
-                VideoView(lk, screenV ?: hostV, Modifier.fillMaxSize())
+                if (yt != null) YtView(Modifier.fillMaxSize(), false, yt)
+                else VideoView(lk, screenV ?: hostV, Modifier.fillMaxSize())
+                if (stream.kind == "audio" && yt == null && screenV == null)
+                    Text("🎙", style = MaterialTheme.typography.displayLarge, modifier = Modifier.align(Alignment.Center))
                 if (screenV != null && hostV != null) VideoView(lk, hostV,
                     Modifier.align(Alignment.BottomEnd).padding(8.dp).size(84.dp, 120.dp))
             }
@@ -624,6 +694,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var notice by remember { mutableStateOf("") }
     var held by remember { mutableStateOf<Bitmap?>(null) }
     var sharing by remember { mutableStateOf(false) }
+    var kind by rememberSaveable { mutableStateOf("live") }
+    var ytId by remember { mutableStateOf("") }
+    var ytCmd by remember { mutableStateOf<JSONObject?>(null) }
+    var showYt by remember { mutableStateOf(false) }
+    var ytText by remember { mutableStateOf("") }
     val shareLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
         val data = res.data
         if (res.resultCode == Activity.RESULT_OK && data != null) scope.launch {
@@ -699,11 +774,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         scope.launch {
             try {
                 status = "Starting…"
-                val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user) }
+                val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user, kind) }
                 roomId = j.id
                 hostKey = j.key
                 lk.connect(j.url, j.token)
-                lk.localParticipant.setCameraEnabled(true)
+                if (kind == "live") lk.localParticipant.setCameraEnabled(true)
                 lk.localParticipant.setMicrophoneEnabled(true)
                 cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                 live = true; status = "LIVE"
@@ -725,7 +800,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner, live, held) {
         val obs = LifecycleEventObserver { _, ev ->
-            if (ev == Lifecycle.Event.ON_RESUME && live && held == null) scope.launch {
+            if (ev == Lifecycle.Event.ON_RESUME && live && held == null && kind == "live") scope.launch {
                 try {
                     lk.localParticipant.setCameraEnabled(false)
                     lk.localParticipant.setCameraEnabled(true)
@@ -764,7 +839,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         // not clean: the server ends the live and the "ended" message does the rest
                     }
                 } else {
-                    val frame = renderer?.let { captureFrame(it) }
+                    val frame = if (kind == "audio") null else renderer?.let { captureFrame(it) }
                     if (frame != null) {
                         if (withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
                             // local detection: block the video on this phone right away
@@ -807,7 +882,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
-            VideoView(lk, cam, Modifier.weight(1f).fillMaxHeight(), onReady = { renderer = it })
+            if (kind == "audio") Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                if (ytId.isNotEmpty()) YtView(Modifier.fillMaxSize(), true, ytCmd) { s ->
+                    if (s.optString("id").isNotEmpty()) scope.launch { try { lk.send(s.put("t", "yt")) } catch (e: Exception) {} }
+                } else Text("🎙", style = MaterialTheme.typography.displayLarge)
+            } else VideoView(lk, cam, Modifier.weight(1f).fillMaxHeight(), onReady = { renderer = it })
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp),
@@ -820,12 +899,34 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             if (notice.isNotEmpty()) Text(notice, color = Color(0xFFFFD54F),
                 modifier = Modifier.background(Color(0xAA000000), RoundedCornerShape(8.dp)).padding(8.dp))
             if (!live) OutlinedTextField(title, { title = it }, label = { Text("Title") }, singleLine = true)
+            if (!live) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SideBtn("🎥 Live", kind == "live") { kind = "live" }
+                SideBtn("🎙 Audio", kind == "audio") { kind = "audio" }
+            }
         }
         if (showViewers) ViewerListDialog(remember(viewers, showViewers) { viewerNames(lk) }) { showViewers = false }
+        if (showYt) AlertDialog(
+            onDismissRequest = { showYt = false },
+            title = { Text("Play a YouTube video") },
+            text = { OutlinedTextField(ytText, { ytText = it }, label = { Text("Paste a YouTube link") }, singleLine = true) },
+            confirmButton = {
+                TextButton({
+                    val id = youtubeId(ytText)
+                    if (id == null) notice = "That is not a YouTube link."
+                    else { ytId = id; ytCmd = JSONObject().put("id", id).put("play", true).put("pos", 0); showYt = false }
+                }) { Text("Play for everyone") }
+            },
+            dismissButton = {
+                if (ytId.isNotEmpty()) TextButton({
+                    scope.launch { try { lk.send(JSONObject().put("t", "yt").put("id", "")) } catch (e: Exception) {} }
+                    ytId = ""; ytCmd = null; showYt = false
+                }) { Text("Stop video") } else TextButton({ showYt = false }) { Text("Cancel") }
+            }
+        )
         if (showPick) {
             var list by remember { mutableStateOf(listOf<Api.Stream>()) }
             LaunchedEffect(Unit) {
-                try { list = withContext(Dispatchers.IO) { Api.streams(server) }.filter { it.id != roomId } }
+                try { list = withContext(Dispatchers.IO) { Api.streams(server) }.filter { it.id != roomId && it.kind != "audio" } }
                 catch (e: Exception) {}
             }
             AlertDialog(
@@ -866,8 +967,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             })
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
-                OutlinedButton({ showPick = true }, enabled = live && !pkActive) { Text("PK") }
-                OutlinedButton({
+                if (kind == "live") OutlinedButton({ showPick = true }, enabled = live && !pkActive) { Text("PK") }
+                if (kind == "audio") OutlinedButton({
                     if (sharing) scope.launch {
                         try { lk.localParticipant.setScreenShareEnabled(false) } catch (e: Exception) {}
                         sharing = false
@@ -876,7 +977,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         shareLauncher.launch(mpm.createScreenCaptureIntent())
                     }
                 }, enabled = live && !pkActive && held == null) { Text(if (sharing) "Unshare" else "Share") }
-                OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
+                if (kind == "audio") OutlinedButton({ showYt = true }, enabled = live) { Text("YouTube") }
+                if (kind == "live") OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
             }
         }
     }
