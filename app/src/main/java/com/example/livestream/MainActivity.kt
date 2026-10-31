@@ -360,6 +360,16 @@ fun youtubeId(s: String): String? {
     return Regex("(?:v=|youtu\\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})").find(t)?.groupValues?.get(1)
 }
 
+// the player library keeps its page inside a WebView somewhere in its view tree
+fun findWebView(v: android.view.View): android.webkit.WebView? {
+    if (v is android.webkit.WebView) return v
+    if (v is android.view.ViewGroup) for (i in 0 until v.childCount) {
+        val w = findWebView(v.getChildAt(i))
+        if (w != null) return w
+    }
+    return null
+}
+
 // "RATE_1_5" -> 1.5
 fun rateValue(r: PlayerConstants.PlaybackRate): Double =
     if (r.name.startsWith("RATE_")) r.name.removePrefix("RATE_").replace('_', '.').toDoubleOrNull() ?: 1.0 else 1.0
@@ -380,6 +390,14 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     val lastSeek = remember { longArrayOf(0L) }
     val rate = remember { doubleArrayOf(1.0) }
     val pendingPause = remember { booleanArrayOf(false) }
+    val capPending = remember { booleanArrayOf(true) }
+    var ccOn by remember { mutableStateOf(false) }
+
+    // viewer's own subtitle switch: the host's setting cannot be read, so viewers start with subtitles off
+    fun setCaptions(on: Boolean) {
+        val w = view[0]?.let { findWebView(it) } ?: return
+        w.evaluateJavascript(if (on) "player.loadModule('captions')" else "player.unloadModule('captions')", null)
+    }
 
     fun applyCmd(c: JSONObject) {
         val p = player[0] ?: return
@@ -393,6 +411,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         if (play && ts > 0) want += ((System.currentTimeMillis() - ts) / 1000.0).coerceIn(0.0, 3.0) * hostRate
         if (id != vid[0]) {
             vid[0] = id
+            capPending[0] = true
             // a new video needs ~1 s to start, so start a bit ahead
             p.loadVideo(id, (want + (if (play) 0.8 else 0.0)).toFloat())
             lastSeek[0] = System.currentTimeMillis()
@@ -408,7 +427,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
                 ?.let { p.setPlaybackRate(it) }
         }
         val now = System.currentTimeMillis()
-        if (Math.abs(pos[0] - want) > 1.0 && now - lastSeek[0] > 3000) {
+        if (Math.abs(pos[0] - want) > 1.5 && now - lastSeek[0] > 5000) {
             p.seekTo(want.toFloat())
             lastSeek[0] = now
         }
@@ -426,6 +445,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
                 if (playing[0]) {
                     st = ""
                     if (pendingPause[0]) { pendingPause[0] = false; youTubePlayer.pause() }
+                    if (!host && capPending[0]) { capPending[0] = false; setCaptions(ccOn) }
                 }
             }
             override fun onCurrentSecond(youTubePlayer: YouTubePlayer, second: Float) { pos[0] = second.toDouble() }
@@ -441,12 +461,15 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
             YouTubePlayerView(c).also { v ->
                 v.enableAutomaticInitialization = false
-                v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(1).build())
+                v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(if (host) 1 else 0).build())
                 view[0] = v
             }
         })
         if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
+        if (!host) TextButton({ ccOn = !ccOn; setCaptions(ccOn) }, Modifier.align(Alignment.BottomEnd)) {
+            Text(if (ccOn) "Subtitles: on" else "Subtitles: off", style = MaterialTheme.typography.bodySmall)
+        }
         TextButton({
             val id = if (vid[0].isNotEmpty()) vid[0] else latest?.optString("id") ?: ""
             if (id.isNotEmpty()) try {
@@ -465,7 +488,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b18-yt-join"
+const val BUILD_TAG = "b20-yt-cc2"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
