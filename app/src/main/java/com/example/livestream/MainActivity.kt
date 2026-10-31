@@ -363,7 +363,7 @@ private const val YT_HTML = """<!DOCTYPE html><html><head><meta name="viewport" 
 <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}body{pointer-events:__PE__}</style></head>
 <body><div id="p"></div><div id="msg" style="position:absolute;left:0;right:0;top:45%;text-align:center;color:#fff;font:14px sans-serif;padding:8px"></div>
 <script>
-function msg(t){document.getElementById('msg').textContent=t;}
+function msg(t){document.getElementById('msg').textContent=t;try{AndroidYt.status(t);}catch(e){}}
 msg('Loading YouTube…');
 var player=null,ready=false,pending=null;
 var s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';s.onerror=function(){msg('Cannot reach YouTube. Check the internet.');};document.head.appendChild(s);
@@ -371,6 +371,7 @@ function onYouTubeIframeAPIReady(){
   player=new YT.Player('p',{host:'https://www.youtube-nocookie.com',width:'100%',height:'100%',
     playerVars:{playsinline:1,controls:__CT__,rel:0,modestbranding:1,fs:0,origin:location.origin,widget_referrer:location.href},
     events:{onReady:function(){ready=true;msg('');if(pending){var c=pending;pending=null;apply(c);}},
+      onStateChange:function(e){if(e.data===1){msg('');}},
       onError:function(e){msg('YouTube cannot play this video here (error '+e.data+')');}}});
 }
 function apply(c){
@@ -388,22 +389,35 @@ function state(){
 }
 </script></body></html>"""
 
+class YtBridge(private val onStatus: (String) -> Unit) {
+    @android.webkit.JavascriptInterface
+    fun status(s: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post { onStatus(s) }
+    }
+}
+
 // Host: has controls and reports its state every 2 s. Viewer: no controls, follows `cmd`.
 @Composable
 fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JSONObject) -> Unit = {}) {
     var web by remember { mutableStateOf<WebView?>(null) }
     val latest by rememberUpdatedState(cmd)
-    AndroidView(modifier = modifier, factory = { c ->
+    var st by remember { mutableStateOf("Starting player…") }
+    Box(modifier) {
+    AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
         WebView(c).also { w ->
+            w.addJavascriptInterface(YtBridge { st = it }, "AndroidYt")
             w.settings.javaScriptEnabled = true
             w.settings.domStorageEnabled = true
             w.settings.mediaPlaybackRequiresUserGesture = false
             w.webChromeClient = WebChromeClient()
             w.webViewClient = object : WebViewClient() {
+                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) { st = "Page loading…" }
+                override fun onPageFinished(view: WebView?, url: String?) { if (st == "Page loading…") st = "Page loaded, waiting for YouTube…" }
                 override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
                     val h = req.url.host ?: ""
                     if (req.isForMainFrame || h.contains("youtube") || h.contains("google") || h.contains("ytimg")) {
                         val d = err.description.toString().replace("'", " ")
+                        st = "Load error: " + d + " (" + h + ")"
                         view.evaluateJavascript("msg('Load error: " + d + " (" + h + ")')", null)
                     }
                 }
@@ -414,6 +428,9 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             web = w
         }
     })
+    if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
+    }
     LaunchedEffect(cmd, web) {
         if (cmd != null) web?.evaluateJavascript("apply(" + cmd.toString() + ")", null)
     }
@@ -422,9 +439,9 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         if (host) while (true) {
             delay(if (loaded) 2000 else 700)
             web?.evaluateJavascript("state()") { r ->
-                var st: JSONObject? = null
-                try { if (r != null && r != "null") st = JSONObject(r) } catch (e: Exception) {}
-                if (st != null && st.optString("id").isNotEmpty()) { loaded = true; onHostState(st) }
+                var hs: JSONObject? = null
+                try { if (r != null && r != "null") hs = JSONObject(r) } catch (e: Exception) {}
+                if (hs != null && hs.optString("id").isNotEmpty()) { loaded = true; onHostState(hs) }
                 else latest?.let { web?.evaluateJavascript("apply(" + it.toString() + ")", null) }
             }
         }
@@ -432,7 +449,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(web) { val w = web; onDispose { try { w?.destroy() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b7-yt-fix"
+const val BUILD_TAG = "b8-yt-status"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
