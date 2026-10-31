@@ -1,8 +1,10 @@
 name: Build APK
 on:
   push:
-    branches: [main, master]
   workflow_dispatch:
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
