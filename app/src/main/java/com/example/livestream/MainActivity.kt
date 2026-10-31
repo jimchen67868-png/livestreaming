@@ -29,6 +29,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -81,7 +82,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val old = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
-            try { note("crash", now() + " " + e + " @ " + (e.stackTrace.firstOrNull()?.toString() ?: "")) } catch (x: Exception) {}
+            try { note("crash", now() + " " + e + " | cause: " + e.cause + " | " + e.stackTrace.take(4).joinToString(" <- ")) } catch (x: Exception) {}
             old?.uncaughtException(t, e)
         }
         note("create", now() + " restored=" + (savedInstanceState != null))
@@ -436,7 +437,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b12-share"
+const val BUILD_TAG = "b13-notif"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -614,7 +615,13 @@ fun HomeScreen(
         if (showDiag) AlertDialog(
             onDismissRequest = { showDiag = false },
             title = { Text("Diagnostics") },
-            text = { Text(diagText(hctx), style = MaterialTheme.typography.bodySmall) },
+            text = { SelectionContainer { Text(diagText(hctx), style = MaterialTheme.typography.bodySmall) } },
+            dismissButton = {
+                TextButton({
+                    val cm = hctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("diagnostics", diagText(hctx)))
+                }) { Text("Copy") }
+            },
             confirmButton = { TextButton({ showDiag = false }) { Text("Close") } }
         )
     }
@@ -784,7 +791,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             try {
                 try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java).putExtra("share", true)) } catch (e: Exception) {}
                 delay(500)
-                lk.localParticipant.setScreenShareEnabled(true, ScreenCaptureParams(data))
+                lk.localParticipant.setScreenShareEnabled(true, ScreenCaptureParams(data, notificationId = 2, notification = liveNotification(ctx, "Sharing your screen")))
                 sharing = true
             } catch (e: Exception) { status = "Share error: ${e.message}" }
         }
