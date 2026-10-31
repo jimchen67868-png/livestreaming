@@ -61,6 +61,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         LocalGuard.load(applicationContext)
+        GenderGuard.load(applicationContext)
         setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
     }
 }
@@ -149,6 +150,68 @@ fun squareThumb(b: Bitmap, out: Int = 160): String {
  * It only decides whether a frame is worth sending to the server for a real check,
  * so it is allowed to be crude (false alarms just cost one server check).
  */
+// ---------- rule: no man + woman together in one camera (needs assets/gender.tflite) ----------
+object GenderGuard {
+    private var interp: Interpreter? = null
+
+    fun load(ctx: Context) {
+        if (interp != null) return
+        interp = try {
+            val fd = ctx.assets.openFd("gender.tflite")
+            Interpreter(FileInputStream(fd.fileDescriptor).channel
+                .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength))
+        } catch (e: Exception) { null }
+    }
+
+    // true when one face is classified as one gender and another face as the other, both with confidence >= 0.85
+    // (works whichever way round the model orders its two classes)
+    @Synchronized
+    fun mixed(src: Bitmap): Boolean {
+        val it = interp ?: return false
+        return try {
+            val w = 480
+            val h = ((w.toFloat() * src.height / src.width).toInt() / 2 * 2).coerceAtLeast(16)
+            val small = Bitmap.createScaledBitmap(src, w, h, true)
+            val b565 = small.copy(Bitmap.Config.RGB_565, false)
+            val found = arrayOfNulls<android.media.FaceDetector.Face>(6)
+            val n = android.media.FaceDetector(w, h, 6).findFaces(b565, found)
+            val pt = android.graphics.PointF()
+            var a = 0
+            var b = 0
+            for (i in 0 until n) {
+                val f = found[i] ?: continue
+                if (f.confidence() < 0.4f) continue
+                f.getMidPoint(pt)
+                val half = (1.5f * f.eyesDistance()).toInt().coerceAtLeast(8)
+                val left = (pt.x - half).toInt().coerceIn(0, w - 2)
+                val top = (pt.y - half).toInt().coerceIn(0, h - 2)
+                val size = minOf(2 * half, w - left, h - top).coerceAtLeast(2)
+                val face = Bitmap.createScaledBitmap(Bitmap.createBitmap(small, left, top, size, size), 128, 128, true)
+                val px = IntArray(128 * 128)
+                face.getPixels(px, 0, 128, 0, 0, 128, 128)
+                val buf = ByteBuffer.allocateDirect(4 * 128 * 128 * 3).order(ByteOrder.nativeOrder())
+                for (p in px) {
+                    buf.putFloat(((p shr 16) and 0xFF) / 255f)
+                    buf.putFloat(((p shr 8) and 0xFF) / 255f)
+                    buf.putFloat((p and 0xFF) / 255f)
+                }
+                buf.rewind()
+                val out = Array(1) { FloatArray(2) }
+                it.run(buf, out)
+                var p0 = out[0][0]
+                var p1 = out[0][1]
+                val sum = p0 + p1
+                if (p0 < 0f || p1 < 0f || sum < 0.9f || sum > 1.1f) {   // logits -> probabilities
+                    val e0 = Math.exp(p0.toDouble()); val e1 = Math.exp(p1.toDouble())
+                    p0 = (e0 / (e0 + e1)).toFloat(); p1 = 1f - p0
+                }
+                if (p0 >= 0.85f) a++ else if (p1 >= 0.85f) b++
+            }
+            a > 0 && b > 0
+        } catch (e: Exception) { false }
+    }
+}
+
 object LocalGuard {
     private const val THRESHOLD = 0.45f   // raise to check less often, lower to be stricter
 
@@ -615,6 +678,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             delay(3000)
             var lastCheck = 0L
             var lastThumb = 0L
+            var mixedStrikes = 0
             while (true) {
                 val now = System.currentTimeMillis()
                 val h = held
@@ -645,6 +709,22 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                             notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
                             try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
                             cam = null
+                        } else if (withContext(Dispatchers.Default) { GenderGuard.mixed(frame) }) {
+                            // rule: no man and woman together in one camera
+                            mixedStrikes++
+                            if (mixedStrikes >= 3) {
+                                status = "Ended: policy violation"
+                                notice = "Your live was ended: a man and a woman can't be on camera together."
+                                stop(); delay(2500); onBack(); break
+                            }
+                            notice = "⚠️ A man and a woman together on camera isn't allowed. Video paused for 15 seconds."
+                            try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
+                            cam = null
+                            delay(15000)
+                            try {
+                                lk.localParticipant.setCameraEnabled(true)
+                                cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                            } catch (e: Exception) {}
                         } else if (now - lastThumb > 30000) {
                             lastThumb = now
                             val t = squareThumb(frame)
@@ -794,6 +874,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
         while (cam == null) delay(500)
         delay(3000)
         var lastCheck = 0L
+        var mixedStrikes = 0
         while (true) {
             val now = System.currentTimeMillis()
             val h = held
@@ -820,6 +901,21 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                     notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
                     try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
                     cam = null
+                } else if (frame != null && withContext(Dispatchers.Default) { GenderGuard.mixed(frame) }) {
+                    // rule: no man and woman together in one camera
+                    mixedStrikes++
+                    if (mixedStrikes >= 3) {
+                        notice = "You were removed: a man and a woman can't be on camera together."
+                        delay(2500); onBack(); break
+                    }
+                    notice = "⚠️ A man and a woman together on camera isn't allowed. Video paused for 15 seconds."
+                    try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
+                    cam = null
+                    delay(15000)
+                    try {
+                        lk.localParticipant.setCameraEnabled(true)
+                        cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
+                    } catch (e: Exception) {}
                 }
             }
             delay(5000)

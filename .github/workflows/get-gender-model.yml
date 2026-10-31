@@ -1,0 +1,20 @@
+name: Get gender model
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install "tensorflow==2.15.1" "numpy<2"
+      - run: python tools/fetch_gender_model.py
+      - run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add app/src/main/assets/gender.tflite
+          git commit -m "Add gender tflite model" || echo "nothing to commit"
+          git push
