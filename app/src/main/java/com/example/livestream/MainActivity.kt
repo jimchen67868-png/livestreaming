@@ -703,6 +703,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var notice by remember { mutableStateOf("") }
     var held by remember { mutableStateOf<Bitmap?>(null) }
     var sharing by remember { mutableStateOf(false) }
+    var muted by remember { mutableStateOf(false) }
     var kind by rememberSaveable { mutableStateOf("live") }
     var ytId by remember { mutableStateOf("") }
     var ytCmd by remember { mutableStateOf<JSONObject?>(null) }
@@ -791,7 +792,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 if (kind == "live") lk.localParticipant.setCameraEnabled(true)
                 lk.localParticipant.setMicrophoneEnabled(true)
                 cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
-                live = true; status = "LIVE"
+                live = true; muted = false; status = "LIVE"
                 try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
             } catch (e: Exception) { status = "Error: ${e.message}" }
         }
@@ -902,7 +903,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("$status • 👁 $viewers", color = Color.White,
+            Text("$status${if (muted) " • 🔇 muted" else ""} • 👁 $viewers", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
                     .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
             if (pkActive) PkBoard(scoreL, scoreR, pkLeft, user, guestName, Modifier.fillMaxWidth())
@@ -978,6 +979,12 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             })
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
+                OutlinedButton({
+                    scope.launch {
+                        try { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
+                        catch (e: Exception) { notice = "Microphone error: ${e.message}" }
+                    }
+                }, enabled = live) { Text(if (muted) "🔇" else "🎤") }
                 if (kind == "live") OutlinedButton({ showPick = true }, enabled = live && !pkActive) { Text("PK") }
                 if (kind == "audio") OutlinedButton({
                     if (sharing) scope.launch {
