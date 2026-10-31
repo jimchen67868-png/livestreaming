@@ -429,10 +429,10 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             }
         }
     }
-    DisposableEffect(web) { onDispose { try { web?.destroy() } catch (e: Exception) {} } }
+    DisposableEffect(web) { val w = web; onDispose { try { w?.destroy() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b6-diag"
+const val BUILD_TAG = "b7-yt-fix"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
