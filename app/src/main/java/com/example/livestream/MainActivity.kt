@@ -291,6 +291,11 @@ object LocalGuard {
     }
 }
 
+// "US" -> flag emoji + space; "" when unknown.
+fun flag(cc: String): String =
+    if (cc.length != 2 || !cc.all { it in 'A'..'Z' }) ""
+    else cc.map { String(Character.toChars(0x1F1E6 + (it - 'A'))) }.joinToString("") + " "
+
 object LiveType {
     // Coarse type from the camera frame: no face = scene, one face = talk, several = group.
     fun detect(src: Bitmap): String = try {
@@ -430,7 +435,7 @@ fun HomeScreen(
     var err by remember { mutableStateOf("") }
     val hctx = LocalContext.current
     val sorted = remember(streams) {
-        streams.sortedWith(compareByDescending<Api.Stream> { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
+        streams.sortedWith(compareByDescending<Api.Stream> { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
     }
     LaunchedEffect(server) {
         while (true) {
@@ -460,7 +465,7 @@ fun HomeScreen(
                         contentAlignment = Alignment.Center) { Text("📺") }
                     Column(Modifier.padding(10.dp)) {
                         Text(r.title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-                        Text("${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                        Text("${flag(r.cc)}${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                     }
                 }
             }

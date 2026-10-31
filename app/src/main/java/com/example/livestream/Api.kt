@@ -9,7 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object Api {
-    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "")
+    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "", val cc: String = "", val same: Boolean = false)
     data class Join(val id: String, val url: String, val token: String, val key: String = "")
 
     private val http = OkHttpClient()
@@ -24,7 +24,7 @@ object Api {
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"), o.optString("type"))
+                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"), o.optString("type"), o.optString("cc"), o.optBoolean("same"))
             }
         }
 

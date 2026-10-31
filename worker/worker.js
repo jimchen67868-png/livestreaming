@@ -85,6 +85,12 @@ const hmac = async (env, msg) => {
 };
 const authed = async (req, env, scope, id) => req.headers.get('X-Key') === (await hmac(env, scope + ':' + id));
 
+// Country from Cloudflare (IP based, country level only). '' when unknown.
+const ccOf = (req) => {
+  const c = String((req.cf && req.cf.country) || '').toUpperCase();
+  return /^[A-Z]{2}$/.test(c) && c !== 'XX' ? c : '';
+};
+
 const json = (o, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 
@@ -100,7 +106,7 @@ export default {
             let m = {};
             try { m = JSON.parse(r.metadata || '{}'); } catch {}
             const n = r.numParticipants ?? r.num_participants ?? 1;
-            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '', type: m.type || '' };
+            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '', type: m.type || '', cc: m.cc || '', same: !!m.cc && m.cc === ccOf(req) };
           });
         return json(out);
       }
@@ -110,7 +116,7 @@ export default {
         const t = String(title || 'Live').slice(0, 60);
         const h = String(host || 'guest').slice(0, 20);
         await twirp(env, 'CreateRoom', { roomCreate: true },
-          { name: id, metadata: JSON.stringify({ title: t, host: h }), empty_timeout: 30 });
+          { name: id, metadata: JSON.stringify({ title: t, host: h, cc: ccOf(req) }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
           video: { room: id, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true } });
         return json({ id, url: env.LK_WS, token, key: await hmac(env, 'host:' + id) });
