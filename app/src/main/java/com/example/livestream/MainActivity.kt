@@ -360,6 +360,10 @@ fun youtubeId(s: String): String? {
     return Regex("(?:v=|youtu\\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})").find(t)?.groupValues?.get(1)
 }
 
+// "RATE_1_5" -> 1.5
+fun rateValue(r: PlayerConstants.PlaybackRate): Double =
+    if (r.name.startsWith("RATE_")) r.name.removePrefix("RATE_").replace('_', '.').toDoubleOrNull() ?: 1.0 else 1.0
+
 // Host: has the player controls and reports id / play state / position every 2 s.
 // Viewer: no controls, follows the host's latest message (`cmd`).
 @Composable
@@ -373,21 +377,39 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     val vid = remember { arrayOf("") }
     val latest by rememberUpdatedState(cmd)
 
+    val lastSeek = remember { longArrayOf(0L) }
+    val rate = remember { doubleArrayOf(1.0) }
+
     fun applyCmd(c: JSONObject) {
         val p = player[0] ?: return
         val id = c.optString("id")
         if (id.isEmpty()) return
-        val want = c.optDouble("pos", 0.0).toFloat()
         val play = c.optBoolean("play", true)
+        var want = c.optDouble("pos", 0.0)
+        val ts = c.optLong("ts", 0L)
+        val hostRate = c.optDouble("rate", 1.0)
+        // the message is a little old when it arrives: while playing, add the time it spent travelling
+        if (play && ts > 0) want += ((System.currentTimeMillis() - ts) / 1000.0).coerceIn(0.0, 3.0) * hostRate
         if (id != vid[0]) {
             vid[0] = id
-            p.loadVideo(id, want)
+            // a new video needs ~1 s to start, so start a bit ahead
+            p.loadVideo(id, (want + (if (play) 0.8 else 0.0)).toFloat())
+            lastSeek[0] = System.currentTimeMillis()
             if (!play) p.pause()
             return
         }
         if (play && !playing[0]) p.play()
         if (!play && playing[0]) p.pause()
-        if (Math.abs(pos[0] - want) > 3.0) p.seekTo(want)
+        if (Math.abs(rate[0] - hostRate) > 0.01) {
+            PlayerConstants.PlaybackRate.values()
+                .firstOrNull { it.name.startsWith("RATE_") && Math.abs(rateValue(it) - hostRate) < 0.01 }
+                ?.let { p.setPlaybackRate(it) }
+        }
+        val now = System.currentTimeMillis()
+        if (Math.abs(pos[0] - want) > 1.0 && now - lastSeek[0] > 3000) {
+            p.seekTo(want.toFloat())
+            lastSeek[0] = now
+        }
     }
 
     val listener = remember {
@@ -403,6 +425,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             }
             override fun onCurrentSecond(youTubePlayer: YouTubePlayer, second: Float) { pos[0] = second.toDouble() }
             override fun onVideoId(youTubePlayer: YouTubePlayer, videoId: String) { vid[0] = videoId }
+            override fun onPlaybackRateChange(youTubePlayer: YouTubePlayer, playbackRate: PlayerConstants.PlaybackRate) { rate[0] = rateValue(playbackRate) }
             override fun onError(youTubePlayer: YouTubePlayer, error: PlayerConstants.PlayerError) {
                 st = "YouTube cannot play this video here ($error)"
             }
@@ -413,7 +436,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         AndroidView(modifier = Modifier.fillMaxSize(), factory = { c ->
             YouTubePlayerView(c).also { v ->
                 v.enableAutomaticInitialization = false
-                v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(if (host) 1 else 0).build())
+                v.initialize(listener, true, IFramePlayerOptions.Builder(c).controls(1).build())
                 view[0] = v
             }
         })
@@ -430,14 +453,14 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     LaunchedEffect(cmd) { if (cmd != null) applyCmd(cmd) }
     LaunchedEffect(host) {
         if (host) while (true) {
-            delay(2000)
-            if (vid[0].isNotEmpty()) onHostState(JSONObject().put("id", vid[0]).put("play", playing[0]).put("pos", pos[0]))
+            delay(1000)
+            if (vid[0].isNotEmpty()) onHostState(JSONObject().put("id", vid[0]).put("play", playing[0]).put("pos", pos[0]).put("rate", rate[0]).put("ts", System.currentTimeMillis()))
         }
     }
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b13-notif"
+const val BUILD_TAG = "b17-yt-rate"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -779,6 +802,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var notice by remember { mutableStateOf("") }
     var held by remember { mutableStateOf<Bitmap?>(null) }
     var sharing by remember { mutableStateOf(false) }
+    var screenTrack by remember { mutableStateOf<LocalVideoTrack?>(null) }
     var muted by remember { mutableStateOf(false) }
     var kind by rememberSaveable { mutableStateOf("live") }
     var ytId by remember { mutableStateOf("") }
@@ -792,8 +816,20 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java).putExtra("share", true)) } catch (e: Exception) {}
                 delay(500)
                 lk.localParticipant.setScreenShareEnabled(true, ScreenCaptureParams(data, notificationId = 2, notification = liveNotification(ctx, "Sharing your screen")))
-                sharing = true
+                val tr = lk.localParticipant.getTrackPublication(Track.Source.SCREEN_SHARE)?.track as? LocalVideoTrack
+                if (tr != null) { screenTrack = tr; sharing = true }
+                else notice = "Screen share did not start. Try again."
             } catch (e: Exception) { status = "Share error: ${e.message}" }
+        }
+    }
+
+    LaunchedEffect(sharing) {
+        while (sharing) {
+            delay(2000)
+            if (lk.localParticipant.getTrackPublication(Track.Source.SCREEN_SHARE) == null) {
+                sharing = false
+                try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
+            }
         }
     }
 
@@ -976,12 +1012,17 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 if (ytId.isNotEmpty()) YtView(Modifier.fillMaxSize(), true, ytCmd) { s ->
                     if (s.optString("id").isNotEmpty()) scope.launch { try { lk.send(s.put("t", "yt")) } catch (e: Exception) {} }
                 } else Text("🎙", style = MaterialTheme.typography.displayLarge)
+                if (sharing) {
+                    Text("🖥 Sharing your screen", color = Color.White, style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 72.dp).background(Color(0x99000000)).padding(8.dp))
+                    screenTrack?.let { VideoView(lk, it, Modifier.align(Alignment.BottomEnd).padding(8.dp).size(90.dp, 160.dp)) }
+                }
             } else VideoView(lk, cam, Modifier.weight(1f).fillMaxHeight(), onReady = { renderer = it })
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("$status${if (muted) " • 🔇 muted" else ""} • 👁 $viewers", color = Color.White,
+            Text("$status${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
                     .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
             if (pkActive) PkBoard(scoreL, scoreR, pkLeft, user, guestName, Modifier.fillMaxWidth())
