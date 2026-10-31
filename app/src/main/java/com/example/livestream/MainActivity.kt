@@ -579,7 +579,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                         }
                         is RoomEvent.TrackUnsubscribed -> {
                             if (isGuest(e.participant.identity?.value)) guestV = null
-                            else if (e.publication.source == Track.Source.SCREEN_SHARE) screenV = null
+                            else if (e.track === screenV) screenV = null
                         }
                         is RoomEvent.DataReceived -> {
                             val o = parseJson(e.data)
