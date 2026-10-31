@@ -291,6 +291,37 @@ object LocalGuard {
     }
 }
 
+object LiveType {
+    // Coarse type from the camera frame: no face = scene, one face = talk, several = group.
+    fun detect(src: Bitmap): String = try {
+        val w = 320
+        val h = ((w.toFloat() * src.height / src.width).toInt() / 2 * 2).coerceAtLeast(16)
+        val b = Bitmap.createScaledBitmap(src, w, h, true).copy(Bitmap.Config.RGB_565, false)
+        val found = arrayOfNulls<android.media.FaceDetector.Face>(4)
+        val n = android.media.FaceDetector(w, h, 4).findFaces(b, found)
+        var faces = 0
+        for (i in 0 until n) if ((found[i]?.confidence() ?: 0f) >= 0.4f) faces++
+        if (faces == 0) "scene" else if (faces == 1) "talk" else "group"
+    } catch (e: Exception) { "" }
+
+    fun icon(t: String) = when (t) { "talk" -> "💬 "; "group" -> "👥 "; "scene" -> "🎬 "; "pk" -> "⚔️ "; else -> "" }
+}
+
+// What this viewer watches: +1 per 30 s visit, older visits fade (x0.95 each time).
+object Pref {
+    private val types = listOf("talk", "group", "scene", "pk")
+    fun score(ctx: Context, t: String): Float =
+        if (t.isEmpty()) 0f else ctx.getSharedPreferences("s", 0).getFloat("pref_$t", 0f)
+
+    fun bump(ctx: Context, t: String) {
+        if (t.isEmpty()) return
+        val sp = ctx.getSharedPreferences("s", 0)
+        val e = sp.edit()
+        for (k in types) e.putFloat("pref_$k", sp.getFloat("pref_$k", 0f) * 0.95f + (if (k == t) 1f else 0f))
+        e.apply()
+    }
+}
+
 fun decodeThumb(b64: String): ImageBitmap? = try {
     if (b64.isEmpty()) null else {
         val b = Base64.decode(b64, Base64.DEFAULT)
@@ -397,6 +428,10 @@ fun HomeScreen(
 ) {
     var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
+    val hctx = LocalContext.current
+    val sorted = remember(streams) {
+        streams.sortedWith(compareByDescending<Api.Stream> { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
+    }
     LaunchedEffect(server) {
         while (true) {
             if (server.isNotBlank()) {
@@ -416,7 +451,7 @@ fun HomeScreen(
         LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(1f),
             horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (streams.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { Text("No one is live yet") }
-            items(streams, key = { it.id }) { r ->
+            items(sorted, key = { it.id }) { r ->
                 Card(Modifier.fillMaxWidth().clickable { onOpen(r) }) {
                     val img = remember(r.thumb) { decodeThumb(r.thumb) }
                     if (img != null) Image(img, null, Modifier.fillMaxWidth().aspectRatio(1f),
@@ -425,7 +460,7 @@ fun HomeScreen(
                         contentAlignment = Alignment.Center) { Text("📺") }
                     Column(Modifier.padding(10.dp)) {
                         Text(r.title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-                        Text("${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                        Text("${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                     }
                 }
             }
@@ -502,6 +537,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
         } catch (e: Exception) { status = "Error: ${e.message}" }
     }
     LaunchedEffect(result) { if (result.isNotEmpty()) { delay(8000); result = "" } }
+    LaunchedEffect(Unit) { delay(30000); Pref.bump(ctx, stream.type) }
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
     BackHandler(onBack = onBack)
 
@@ -728,8 +764,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         } else if (now - lastThumb > 30000) {
                             lastThumb = now
                             val t = squareThumb(frame)
+                            val ty = if (pkActive) "pk" else withContext(Dispatchers.Default) { LiveType.detect(frame) }
                             withContext(Dispatchers.IO) {
-                                try { Api.setThumb(server, roomId, t, hostKey) } catch (e: Exception) {}
+                                try { Api.setThumb(server, roomId, t, hostKey, ty) } catch (e: Exception) {}
                             }
                         }
                     }

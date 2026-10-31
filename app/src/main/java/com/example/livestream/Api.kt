@@ -9,7 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object Api {
-    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "")
+    data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "")
     data class Join(val id: String, val url: String, val token: String, val key: String = "")
 
     private val http = OkHttpClient()
@@ -24,7 +24,7 @@ object Api {
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"))
+                Stream(o.getString("id"), o.getString("title"), o.getString("host"), o.getInt("viewers"), o.optString("thumb"), o.optString("type"))
             }
         }
 
@@ -38,8 +38,8 @@ object Api {
         }
     }
 
-    fun setThumb(server: String, id: String, thumb: String, key: String) {
-        val body = JSONObject().put("thumb", thumb).toString().toRequestBody("application/json".toMediaType())
+    fun setThumb(server: String, id: String, thumb: String, key: String, type: String = "") {
+        val body = JSONObject().put("thumb", thumb).put("type", type).toString().toRequestBody("application/json".toMediaType())
         http.newCall(Request.Builder().url("${base(server)}/rooms/$id/thumb").header("X-Key", key).post(body).build())
             .execute().close()
     }

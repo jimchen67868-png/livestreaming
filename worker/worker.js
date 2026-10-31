@@ -100,7 +100,7 @@ export default {
             let m = {};
             try { m = JSON.parse(r.metadata || '{}'); } catch {}
             const n = r.numParticipants ?? r.num_participants ?? 1;
-            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '' };
+            return { id: r.name, title: m.title || 'Live', host: m.host || 'host', viewers: Math.max(0, n - 1), thumb: m.thumb || '', type: m.type || '' };
           });
         return json(out);
       }
@@ -119,12 +119,13 @@ export default {
       if (req.method === 'POST' && mt) {
         const id = mt[1];
         if (!(await authed(req, env, 'host', id))) return json({ error: 'forbidden' }, 403);
-        const { thumb } = await req.json();
+        const { thumb, type } = await req.json();
         if (typeof thumb !== 'string' || thumb.length > 40000) return json({ error: 'bad thumb' }, 400);
         const r = await getRoom(env, id);
         if (!r) return json({ error: 'no room' }, 404);
         const m = parseMeta(r);
         m.thumb = thumb;
+        if (['talk', 'group', 'scene', 'pk'].includes(type)) m.type = type;
         await updateMeta(env, id, m);
         return json({ ok: true });
       }
