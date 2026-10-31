@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.media.projection.MediaProjectionManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -341,14 +342,17 @@ fun youtubeId(s: String): String? {
 
 private const val YT_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{width:100%;height:100%}body{pointer-events:__PE__}</style></head>
-<body><div id="p"></div>
+<body><div id="p"></div><div id="msg" style="position:absolute;left:0;right:0;top:45%;text-align:center;color:#fff;font:14px sans-serif;padding:8px"></div>
 <script>
+function msg(t){document.getElementById('msg').textContent=t;}
+msg('Loading YouTube…');
 var player=null,ready=false,pending=null;
-var s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
+var s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';s.onerror=function(){msg('Cannot reach YouTube. Check the internet.');};document.head.appendChild(s);
 function onYouTubeIframeAPIReady(){
   player=new YT.Player('p',{host:'https://www.youtube-nocookie.com',width:'100%',height:'100%',
-    playerVars:{playsinline:1,controls:__CT__,rel:0,modestbranding:1,fs:0},
-    events:{onReady:function(){ready=true;if(pending){var c=pending;pending=null;apply(c);}}}});
+    playerVars:{playsinline:1,controls:__CT__,rel:0,modestbranding:1,fs:0,origin:location.origin,widget_referrer:location.href},
+    events:{onReady:function(){ready=true;msg('');if(pending){var c=pending;pending=null;apply(c);}},
+      onError:function(e){msg('YouTube cannot play this video here (error '+e.data+')');}}});
 }
 function apply(c){
   if(!ready){pending=c;return;}
@@ -369,6 +373,7 @@ function state(){
 @Composable
 fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JSONObject) -> Unit = {}) {
     var web by remember { mutableStateOf<WebView?>(null) }
+    val latest by rememberUpdatedState(cmd)
     AndroidView(modifier = modifier, factory = { c ->
         WebView(c).also { w ->
             w.settings.javaScriptEnabled = true
@@ -385,10 +390,14 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         if (cmd != null) web?.evaluateJavascript("apply(" + cmd.toString() + ")", null)
     }
     LaunchedEffect(web, host) {
+        var loaded = false
         if (host) while (true) {
-            delay(2000)
+            delay(if (loaded) 2000 else 700)
             web?.evaluateJavascript("state()") { r ->
-                try { if (r != null && r != "null") onHostState(JSONObject(r)) } catch (e: Exception) {}
+                var st: JSONObject? = null
+                try { if (r != null && r != "null") st = JSONObject(r) } catch (e: Exception) {}
+                if (st != null && st.optString("id").isNotEmpty()) { loaded = true; onHostState(st) }
+                else latest?.let { web?.evaluateJavascript("apply(" + it.toString() + ")", null) }
             }
         }
     }
@@ -750,7 +759,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     viewers = viewerCount(lk)
                     if (isGuest(e.participant.identity?.value)) { endPk(); guestV = null }
                 }
-                is RoomEvent.Disconnected -> { live = false; cam = null; if (!status.startsWith("Ended")) status = "Disconnected" }
+                is RoomEvent.Disconnected -> { live = false; cam = null; if (!status.startsWith("Ended")) status = "Disconnected"; try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} }
                 else -> {}
             }
         }
@@ -769,6 +778,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
 
     fun stop() {
         lk.disconnect(); live = false; cam = null; sharing = false; status = "Ended"
+        try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
     }
     fun start() {
         scope.launch {
@@ -782,6 +792,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 lk.localParticipant.setMicrophoneEnabled(true)
                 cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                 live = true; status = "LIVE"
+                try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
             } catch (e: Exception) { status = "Error: ${e.message}" }
         }
     }
@@ -796,7 +807,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         }
     }
 
-    DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
+    DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release(); try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} } }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner, live, held) {
         val obs = LifecycleEventObserver { _, ev ->
