@@ -22,7 +22,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -43,6 +46,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -361,6 +368,15 @@ fun youtubeId(s: String): String? {
     return Regex("(?:v=|youtu\\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})").find(t)?.groupValues?.get(1)
 }
 
+fun findActivity(ctx: Context): Activity? {
+    var c: Context = ctx
+    while (c is android.content.ContextWrapper) {
+        if (c is Activity) return c
+        c = c.baseContext
+    }
+    return null
+}
+
 // the player library keeps its page inside a WebView somewhere in its view tree
 fun findWebView(v: android.view.View): android.webkit.WebView? {
     if (v is android.webkit.WebView) return v
@@ -393,6 +409,9 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     val pendingPause = remember { booleanArrayOf(false) }
     val capPending = remember { booleanArrayOf(true) }
     var ccOn by remember { mutableStateOf(false) }
+    var full by remember { mutableStateOf(false) }
+    var zoom by remember { mutableStateOf(false) }
+    val act = remember { findActivity(ctx) }
 
     // viewer's own subtitle switch: the host's setting cannot be read, so viewers start with subtitles off
     fun setCaptions(on: Boolean) {
@@ -461,9 +480,12 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     Box(modifier.background(Color.Black).clipToBounds()) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
             // Viewers: the player is made taller and pushed up so YouTube's title / share strip falls outside the screen.
+            // The player library keeps the picture in a 16:9 box. Zoom enlarges that box so a tall (portrait) video fills the screen.
+            val zs = if (zoom) (maxHeight.value / (maxWidth.value * 9f / 16f)).coerceIn(1f, 3f) else 1f
             AndroidView(
-                modifier = if (host) Modifier.fillMaxSize()
-                else Modifier.requiredSize(maxWidth, maxHeight + 72.dp).offset(y = (-72).dp),
+                modifier = (if (host) Modifier.fillMaxSize()
+                else Modifier.requiredSize(maxWidth, maxHeight + 72.dp).offset(y = (-72).dp))
+                    .graphicsLayer(scaleX = zs, scaleY = zs),
                 factory = { c ->
                     YouTubePlayerView(c).also { v ->
                         v.enableAutomaticInitialization = false
@@ -475,6 +497,16 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
         }
         if (st.isNotEmpty()) Text(st, color = Color.White, style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000)))
+        Row(Modifier.align(Alignment.TopEnd)) {
+            TextButton({ zoom = !zoom }) { Text(if (zoom) "Zoom ✓" else "Zoom", style = MaterialTheme.typography.bodySmall) }
+            TextButton({
+                full = !full
+                act?.requestedOrientation = if (full) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                    else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }) {
+                Text(if (full) "Exit full screen" else "Full screen", style = MaterialTheme.typography.bodySmall)
+            }
+        }
         if (!host) TextButton({ ccOn = !ccOn; setCaptions(ccOn) }, Modifier.align(Alignment.BottomEnd)) {
             Text(if (ccOn) "Subtitles: on" else "Subtitles: off", style = MaterialTheme.typography.bodySmall)
         }
@@ -493,10 +525,15 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
             if (vid[0].isNotEmpty()) onHostState(JSONObject().put("id", vid[0]).put("play", playing[0]).put("pos", pos[0]).put("rate", rate[0]).put("ts", System.currentTimeMillis()))
         }
     }
-    DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
+    DisposableEffect(Unit) {
+        onDispose {
+            try { view[0]?.release() } catch (e: Exception) {}
+            try { act?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED } catch (e: Exception) {}
+        }
+    }
 }
 
-const val BUILD_TAG = "b22-ratio"
+const val BUILD_TAG = "b27-swipe3"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -713,6 +750,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     var screenV by remember { mutableStateOf<VideoTrack?>(null) }
     var yt by remember { mutableStateOf<JSONObject?>(null) }
     var fillMode by rememberSaveable { mutableStateOf(false) }
+    var chatHidden by rememberSaveable { mutableStateOf(false) }
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
@@ -781,7 +819,21 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
     BackHandler(onBack = onBack)
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
+    Box(Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) {
+        // swipe left = hide chat and message bar, swipe right = show them again
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            var dx = 0f
+            var dy = 0f
+            do {
+                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                val c = ev.changes.firstOrNull() ?: break
+                dx += c.positionChange().x
+                dy += c.positionChange().y
+            } while (ev.changes.any { it.pressed })
+            if (Math.abs(dx) > 120f && Math.abs(dx) > Math.abs(dy) * 1.5f) chatHidden = dx < 0
+        }
+    }) {
         Row(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f).fillMaxHeight()) {
                 if (yt != null) YtView(Modifier.fillMaxSize(), false, yt)
@@ -805,7 +857,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
-            Text("${stream.title} • 👁 $viewers", color = Color.White,
+            if (!chatHidden) Text("${stream.title} • 👁 $viewers", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }.padding(12.dp))
             pk?.let { PkBoard(it[0], it[1], it[2], stream.host, guestName, Modifier.fillMaxWidth()) }
             if (result.isNotEmpty()) Text(result, color = Color.White,
@@ -816,11 +868,11 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
         if (ended) Text("Stream ended", color = Color.White, modifier = Modifier.align(Alignment.Center))
         else if (status.isNotEmpty()) Text(status, color = Color.White, modifier = Modifier.align(Alignment.Center))
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (pk != null) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (pk != null && !chatHidden) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SideBtn("Support ${stream.host}", side == "L") { side = "L" }
                 SideBtn("Support $guestName", side == "R") { side = "R" }
             }
-            Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (!chatHidden) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("❤️", "🌹", "🚀").forEach { g ->
                     FilledTonalButton({
                         msgs.addCapped("$user sent $g")
@@ -828,10 +880,12 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     }) { Text(g) }
                 }
             }
-            ChatOverlay(msgs, onSend = {
-                msgs.addCapped("$user: $it")
-                scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
-            })
+            AnimatedVisibility(!chatHidden) {
+                ChatOverlay(msgs, onSend = {
+                    msgs.addCapped("$user: $it")
+                    scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
+                })
+            }
         }
     }
 }
