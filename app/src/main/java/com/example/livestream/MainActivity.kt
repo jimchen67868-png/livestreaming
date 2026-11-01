@@ -496,7 +496,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     DisposableEffect(Unit) { onDispose { try { view[0]?.release() } catch (e: Exception) {} } }
 }
 
-const val BUILD_TAG = "b21-yt-crop"
+const val BUILD_TAG = "b22-ratio"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -531,9 +531,24 @@ fun decodeThumb(b64: String): ImageBitmap? = try {
 } catch (e: Exception) { null }
 
 // ---------- shared UI ----------
+// "9:16" -> 0.5625 ; "auto" / unknown -> null (no frame)
+fun ratioValue(s: String): Float? = when (s) { "9:16" -> 9f / 16f; "16:9" -> 16f / 9f; "1:1" -> 1f; else -> null }
+
+// Fill = crop the picture to fill the view, Fit = show the whole picture. Done by name so it cannot break the build.
+fun setFillMode(r: TextureViewRenderer, fill: Boolean) {
+    try {
+        val m = r.javaClass.methods.firstOrNull { it.name == "setScalingType" && it.parameterTypes.size == 1 }
+        val c = m?.parameterTypes?.get(0)?.enumConstants?.firstOrNull {
+            (it as Enum<*>).name == (if (fill) "SCALE_ASPECT_FILL" else "SCALE_ASPECT_FIT")
+        }
+        if (m != null && c != null) m.invoke(r, c)
+    } catch (e: Exception) {}
+}
+
 @Composable
-fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onReady: (TextureViewRenderer) -> Unit = {}) {
+fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onReady: (TextureViewRenderer) -> Unit = {}, scaleFill: Boolean? = null) {
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
+    LaunchedEffect(scaleFill, renderer) { val r = renderer; if (r != null && scaleFill != null) setFillMode(r, scaleFill) }
     AndroidView(
         factory = { c -> TextureViewRenderer(c).also { room.initVideoRenderer(it); renderer = it; onReady(it) } },
         modifier = modifier
@@ -697,6 +712,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     var hostV by remember { mutableStateOf<VideoTrack?>(null) }
     var screenV by remember { mutableStateOf<VideoTrack?>(null) }
     var yt by remember { mutableStateOf<JSONObject?>(null) }
+    var fillMode by rememberSaveable { mutableStateOf(false) }
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
@@ -769,7 +785,18 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
         Row(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f).fillMaxHeight()) {
                 if (yt != null) YtView(Modifier.fillMaxSize(), false, yt)
-                else VideoView(lk, screenV ?: hostV, Modifier.fillMaxSize())
+                else {
+                    val fr = ratioValue(stream.ratio)
+                    val framed = fr != null && screenV == null && !fillMode
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        VideoView(lk, screenV ?: hostV, if (framed) Modifier.aspectRatio(fr!!) else Modifier.fillMaxSize(),
+                            scaleFill = if (screenV != null) false else if (framed || fillMode) true else null)
+                    }
+                }
+                if (yt == null && screenV == null && stream.kind != "audio")
+                    TextButton({ fillMode = !fillMode }, Modifier.align(Alignment.TopEnd).padding(top = 64.dp)) {
+                        Text(if (fillMode) "Fill" else "Fit", style = MaterialTheme.typography.bodySmall)
+                    }
                 if (stream.kind == "audio" && yt == null && screenV == null)
                     Text("🎙", style = MaterialTheme.typography.displayLarge, modifier = Modifier.align(Alignment.Center))
                 if (screenV != null && hostV != null) VideoView(lk, hostV,
@@ -841,6 +868,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var screenTrack by remember { mutableStateOf<LocalVideoTrack?>(null) }
     var muted by remember { mutableStateOf(false) }
     var kind by rememberSaveable { mutableStateOf("live") }
+    var ratio by rememberSaveable { mutableStateOf("auto") }
     var ytId by remember { mutableStateOf("") }
     var ytCmd by remember { mutableStateOf<JSONObject?>(null) }
     var showYt by remember { mutableStateOf(false) }
@@ -935,7 +963,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         scope.launch {
             try {
                 status = "Starting…"
-                val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user, kind) }
+                val j = withContext(Dispatchers.IO) { Api.createRoom(server, title, user, kind, ratio) }
                 roomId = j.id
                 hostKey = j.key
                 lk.connect(j.url, j.token)
@@ -1053,7 +1081,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         modifier = Modifier.align(Alignment.TopCenter).padding(top = 72.dp).background(Color(0x99000000)).padding(8.dp))
                     screenTrack?.let { VideoView(lk, it, Modifier.align(Alignment.BottomEnd).padding(8.dp).size(90.dp, 160.dp)) }
                 }
-            } else VideoView(lk, cam, Modifier.weight(1f).fillMaxHeight(), onReady = { renderer = it })
+            } else Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                val fr = ratioValue(ratio)
+                VideoView(lk, cam, if (fr != null) Modifier.aspectRatio(fr) else Modifier.fillMaxSize(),
+                    onReady = { renderer = it }, scaleFill = if (fr != null) true else null)
+            }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp),
@@ -1069,6 +1101,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             if (!live) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SideBtn("🎥 Live", kind == "live") { kind = "live" }
                 SideBtn("🎙 Audio", kind == "audio") { kind = "audio" }
+            }
+            if (!live && kind == "live") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (r in listOf("auto", "9:16", "16:9", "1:1")) SideBtn(if (r == "auto") "Auto" else r, ratio == r) { ratio = r }
             }
         }
         if (showViewers) ViewerListDialog(remember(viewers, showViewers) { viewerNames(lk) }) { showViewers = false }
