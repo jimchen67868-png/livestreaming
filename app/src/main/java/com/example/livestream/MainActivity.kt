@@ -87,6 +87,8 @@ class MainActivity : ComponentActivity() {
     private var downX = 0f
     private var downY = 0f
     private var dragging = false
+    private var maxDx = 0f
+    private var maxDy = 0f
 
     private fun note(key: String, v: String) {
         getSharedPreferences("diag", 0).edit().putString(key, v).commit()
@@ -96,14 +98,17 @@ class MainActivity : ComponentActivity() {
     // Looks at every touch (video, chat, buttons) and reports sideways drags. It never blocks the touch.
     override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
         when (ev.actionMasked) {
-            android.view.MotionEvent.ACTION_DOWN -> { downX = ev.rawX; downY = ev.rawY; dragging = false }
+            android.view.MotionEvent.ACTION_DOWN -> { downX = ev.rawX; downY = ev.rawY; dragging = false; maxDx = 0f; maxDy = 0f }
             android.view.MotionEvent.ACTION_MOVE -> {
                 val dx = ev.rawX - downX
                 val dy = ev.rawY - downY
-                if (!dragging && Math.abs(dx) > 40f && Math.abs(dx) > Math.abs(dy) * 1.5f) dragging = true
+                if (Math.abs(dx) > maxDx) maxDx = Math.abs(dx)
+                if (Math.abs(dy) > maxDy) maxDy = Math.abs(dy)
+                if (!dragging && Math.abs(dx) > 16f && Math.abs(dx) > Math.abs(dy)) dragging = true
                 if (dragging) SwipeBus.onDrag?.invoke(dx)
             }
             android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                note("swipe", now() + " drag=" + dragging + " maxDx=" + maxDx.toInt() + " maxDy=" + maxDy.toInt() + " handler=" + (SwipeBus.onDrag != null))
                 if (dragging) SwipeBus.onRelease?.invoke(ev.rawX - downX)
                 dragging = false
             }
@@ -563,7 +568,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b30-fgcam"
+const val BUILD_TAG = "b33-shareratio"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -576,6 +581,7 @@ fun diagText(ctx: Context): String {
     val sb = StringBuilder("Build: $BUILD_TAG\n")
     sb.append("create: ").append(d.getString("create", "-")).append("\n")
     sb.append("destroy: ").append(d.getString("destroy", "-")).append("\n")
+    sb.append("swipe: ").append(d.getString("swipe", "-")).append("\n")
     sb.append("crash: ").append(d.getString("crash", "none")).append("\n")
     if (android.os.Build.VERSION.SDK_INT >= 30) {
         try {
@@ -863,6 +869,20 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
         onDispose { SwipeBus.onDrag = null; SwipeBus.onRelease = null }
     }
     BackHandler(onBack = onBack)
+    // real picture shape of the host's shared screen: the view is sized to it, so nothing is cropped or zoomed
+    var shareAspect by remember { mutableStateOf(0f) }
+    DisposableEffect(screenV) {
+        val t = screenV
+        val sink = org.webrtc.VideoSink { f ->
+            val w = f.rotatedWidth; val h = f.rotatedHeight
+            if (w > 0 && h > 0) {
+                val asp = w.toFloat() / h
+                if (Math.abs(asp - shareAspect) > 0.01f) shareAspect = asp
+            }
+        }
+        t?.addRenderer(sink)
+        onDispose { t?.removeRenderer(sink) }
+    }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
@@ -872,8 +892,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     val fr = ratioValue(stream.ratio)
                     val framed = fr != null && screenV == null && !fillMode
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        VideoView(lk, screenV ?: hostV, if (framed) Modifier.aspectRatio(fr!!) else Modifier.fillMaxSize(),
-                            scaleFill = if (screenV != null) false else if (framed || fillMode) true else null)
+                        VideoView(lk, screenV ?: hostV,
+                            if (screenV != null && shareAspect > 0f) Modifier.aspectRatio(shareAspect)
+                            else if (framed) Modifier.aspectRatio(fr!!) else Modifier.fillMaxSize(),
+                            scaleFill = if (screenV != null) shareAspect > 0f else if (framed || fillMode) true else null)
                     }
                 }
                 if (yt == null && screenV == null && stream.kind != "audio")
@@ -937,6 +959,22 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var roomId by remember { mutableStateOf("") }
     var hostKey by remember { mutableStateOf("") }
+    // swipe left = hide chat and status, swipe right = show them (swipes are reported by MainActivity)
+    var chatHidden by rememberSaveable { mutableStateOf(false) }
+    val wPx = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() }
+    val offsetX = remember { Animatable(if (chatHidden) -wPx else 0f) }
+    DisposableEffect(wPx) {
+        SwipeBus.onDrag = { dx ->
+            val base = if (chatHidden) -wPx else 0f
+            scope.launch { offsetX.snapTo((base + dx).coerceIn(-wPx, 0f)) }
+        }
+        SwipeBus.onRelease = { dx ->
+            val hide = if (chatHidden) !(dx > wPx * 0.25f) else dx < -wPx * 0.25f
+            chatHidden = hide
+            scope.launch { offsetX.animateTo(if (hide) -wPx else 0f) }
+        }
+        onDispose { SwipeBus.onDrag = null; SwipeBus.onRelease = null }
+    }
     val msgs = remember { mutableStateListOf<String>() }
     // PK
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
@@ -1174,7 +1212,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
-        Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp),
+        Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp)
+            .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("$status${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
@@ -1249,7 +1288,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             )
         }
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (live) ChatOverlay(msgs, onSend = {
+            if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, onSend = {
                 msgs.addCapped("$user: $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
