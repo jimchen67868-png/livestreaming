@@ -568,7 +568,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b33-shareratio"
+const val BUILD_TAG = "b34-shareratio2"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -617,6 +617,37 @@ fun setFillMode(r: TextureViewRenderer, fill: Boolean) {
         if (m != null && c != null) m.invoke(r, c)
     } catch (e: Exception) {}
 }
+
+// Reports the real width/height of the frames of a video track. Done by name (reflection) so it cannot break the build.
+fun frameAspectWatch(track: VideoTrack, onAspect: (Float) -> Unit): (() -> Unit)? = try {
+    val add = track.javaClass.methods.first { it.name == "addRenderer" && it.parameterTypes.size == 1 }
+    val rem = track.javaClass.methods.first { it.name == "removeRenderer" && it.parameterTypes.size == 1 }
+    val sinkType = add.parameterTypes[0]
+    var gw: java.lang.reflect.Method? = null
+    var gh: java.lang.reflect.Method? = null
+    val sink = java.lang.reflect.Proxy.newProxyInstance(sinkType.classLoader, arrayOf(sinkType)) { proxy, m, args ->
+        when (m.name) {
+            "hashCode" -> System.identityHashCode(proxy)
+            "equals" -> proxy === args?.getOrNull(0)
+            "toString" -> "frameAspectSink"
+            else -> {
+                try {
+                    val f = args?.getOrNull(0)
+                    if (m.name == "onFrame" && f != null) {
+                        if (gw == null) { gw = f.javaClass.getMethod("getRotatedWidth"); gh = f.javaClass.getMethod("getRotatedHeight") }
+                        val w = gw!!.invoke(f) as Int
+                        val h = gh!!.invoke(f) as Int
+                        if (w > 0 && h > 0) onAspect(w.toFloat() / h)
+                    }
+                } catch (e: Exception) {}
+                null
+            }
+        }
+    }
+    add.invoke(track, sink)
+    val undo: () -> Unit = { try { rem.invoke(track, sink) } catch (e: Exception) {} }
+    undo
+} catch (e: Exception) { null }
 
 @Composable
 fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onReady: (TextureViewRenderer) -> Unit = {}, scaleFill: Boolean? = null) {
@@ -872,16 +903,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     // real picture shape of the host's shared screen: the view is sized to it, so nothing is cropped or zoomed
     var shareAspect by remember { mutableStateOf(0f) }
     DisposableEffect(screenV) {
-        val t = screenV
-        val sink = org.webrtc.VideoSink { f ->
-            val w = f.rotatedWidth; val h = f.rotatedHeight
-            if (w > 0 && h > 0) {
-                val asp = w.toFloat() / h
-                if (Math.abs(asp - shareAspect) > 0.01f) shareAspect = asp
-            }
-        }
-        t?.addRenderer(sink)
-        onDispose { t?.removeRenderer(sink) }
+        val undo = screenV?.let { frameAspectWatch(it) { asp -> if (Math.abs(asp - shareAspect) > 0.01f) shareAspect = asp } }
+        onDispose { undo?.invoke() }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
