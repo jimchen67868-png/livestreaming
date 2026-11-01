@@ -38,9 +38,10 @@ class LiveService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val share = intent?.getBooleanExtra("share", false) == true
+        val withCam = intent?.getBooleanExtra("cam", false) == true
         val n = liveNotification(this, if (share) "Sharing your screen" else "You are live")
         if (Build.VERSION.SDK_INT >= 30) {
-            val mic = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            val mic = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or (if (withCam) ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA else 0)
             try {
                 // While sharing the screen, Android 14 needs a mediaProjection service running BEFORE the capture starts.
                 startForeground(1, n, if (share) mic or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else mic)

@@ -563,7 +563,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b29-drag"
+const val BUILD_TAG = "b30-fgcam"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -1057,7 +1057,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 lk.localParticipant.setMicrophoneEnabled(true)
                 cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                 live = true; muted = false; status = "LIVE"
-                try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
+                try { ContextCompat.startForegroundService(ctx, Intent(ctx, LiveService::class.java).putExtra("cam", kind == "live")) } catch (e: Exception) {}
             } catch (e: Exception) { status = "Error: ${e.message}" }
         }
     }
