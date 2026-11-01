@@ -117,9 +117,13 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        try { FloatChat.hide(this) } catch (e: Exception) {}
         note("destroy", now() + " changing=" + isChangingConfigurations + " finishing=" + isFinishing)
         super.onDestroy()
     }
+
+    override fun onStart() { super.onStart(); appVisible = true; clearChatNotification(this) }
+    override fun onStop() { appVisible = false; super.onStop() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -568,7 +572,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b37-nozoom"
+const val BUILD_TAG = "b39-floatchat"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -693,20 +697,74 @@ fun PermGate(onBack: () -> Unit, content: @Composable () -> Unit) {
     val ctx = LocalContext.current
     var granted by remember { mutableStateOf(hasPerms(ctx)) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        granted = it.values.all { ok -> ok }
+        granted = it[Manifest.permission.CAMERA] == true && it[Manifest.permission.RECORD_AUDIO] == true
     }
     LaunchedEffect(Unit) {
-        if (!granted) launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
+        if (!granted || !notifAllowed(ctx)) launcher.launch(permsToAsk())
     }
     BackHandler(enabled = !granted, onBack = onBack)
     if (granted) content()
     else Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
         Text("Camera and microphone access is needed to broadcast.")
         Spacer(Modifier.height(12.dp))
-        Button({ launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) }) {
+        Button({ launcher.launch(permsToAsk()) }) {
             Text("Grant permissions")
         }
     }
+}
+
+
+// ---------- chat notifications for the host while the app is in the background ----------
+@Volatile var appVisible = true
+private val notifLines = mutableListOf<String>()
+
+fun notifAllowed(ctx: Context): Boolean =
+    android.os.Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+fun permsToAsk(): Array<String> =
+    if (android.os.Build.VERSION.SDK_INT >= 33)
+        arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+    else arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+
+// Shows the newest chat lines as a pop-up banner while the host is in another app (e.g. while sharing the screen).
+fun notifyChat(ctx: Context, line: String) {
+    if (appVisible) return
+    if (FloatChat.canShow(ctx)) { FloatChat.add(ctx, line); return }
+    if (!notifAllowed(ctx)) return
+    try {
+        synchronized(notifLines) { notifLines.add(line); while (notifLines.size > 5) notifLines.removeAt(0) }
+        val nm = ctx.getSystemService(android.app.NotificationManager::class.java)
+        if (android.os.Build.VERSION.SDK_INT >= 26)
+            nm.createNotificationChannel(android.app.NotificationChannel("chatmsg", "Live chat", android.app.NotificationManager.IMPORTANCE_HIGH))
+        val open = android.app.PendingIntent.getActivity(
+            ctx, 1,
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val style = androidx.core.app.NotificationCompat.InboxStyle()
+        val copy = synchronized(notifLines) { notifLines.toList() }
+        copy.forEach { style.addLine(it) }
+        val n = androidx.core.app.NotificationCompat.Builder(ctx, "chatmsg")
+            .setSmallIcon(android.R.drawable.ic_dialog_email)
+            .setContentTitle("Live chat")
+            .setContentText(line)
+            .setStyle(style)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setCategory(androidx.core.app.NotificationCompat.CATEGORY_MESSAGE)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        nm.notify(3, n)
+    } catch (e: Exception) {}
+}
+
+fun clearChatNotification(ctx: Context) {
+    try {
+        synchronized(notifLines) { notifLines.clear() }
+        ctx.getSystemService(android.app.NotificationManager::class.java).cancel(3)
+        FloatChat.hide(ctx)
+    } catch (e: Exception) {}
 }
 
 // ---------- Home ----------
@@ -1032,9 +1090,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 is RoomEvent.DataReceived -> {
                     val o = parseJson(e.data)
                     if (o != null) when (o.optString("t")) {
-                        "chat" -> chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                        "chat" -> chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it); notifyChat(ctx, it) }
                         "gift" -> {
-                            chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                            chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it); notifyChat(ctx, it) }
                             if (pkActive && !isGuest(e.participant?.identity?.value)) {
                                 val v = giftValue(o.optString("g"))
                                 if (o.optString("s") == "R") scoreR += v else scoreL += v
@@ -1304,6 +1362,10 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 }, enabled = live && !pkActive && held == null) { Text(if (sharing) "Unshare" else "Share") }
                 if (kind == "audio") OutlinedButton({ showYt = true }, enabled = live && !sharing) { Text("YouTube") }
                 if (kind == "live") OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
+                OutlinedButton({
+                    if (FloatChat.canShow(ctx)) android.widget.Toast.makeText(ctx, "Floating chat is on: it shows when you leave the app", android.widget.Toast.LENGTH_LONG).show()
+                    else FloatChat.askPermission(ctx)
+                }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("💬") }
             }
         }
     }
