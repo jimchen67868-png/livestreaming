@@ -23,6 +23,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -46,6 +47,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -75,11 +78,38 @@ import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import org.tensorflow.lite.Interpreter
 
+object SwipeBus {
+    var onDrag: ((Float) -> Unit)? = null      // finger moved sideways by dx pixels since touch-down
+    var onRelease: ((Float) -> Unit)? = null   // finger lifted after a sideways drag of dx pixels
+}
+
 class MainActivity : ComponentActivity() {
+    private var downX = 0f
+    private var downY = 0f
+    private var dragging = false
+
     private fun note(key: String, v: String) {
         getSharedPreferences("diag", 0).edit().putString(key, v).commit()
     }
     private fun now() = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+
+    // Looks at every touch (video, chat, buttons) and reports sideways drags. It never blocks the touch.
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> { downX = ev.rawX; downY = ev.rawY; dragging = false }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dx = ev.rawX - downX
+                val dy = ev.rawY - downY
+                if (!dragging && Math.abs(dx) > 40f && Math.abs(dx) > Math.abs(dy) * 1.5f) dragging = true
+                if (dragging) SwipeBus.onDrag?.invoke(dx)
+            }
+            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                if (dragging) SwipeBus.onRelease?.invoke(ev.rawX - downX)
+                dragging = false
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
 
     override fun onDestroy() {
         note("destroy", now() + " changing=" + isChangingConfigurations + " finishing=" + isFinishing)
@@ -533,7 +563,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b27-swipe3"
+const val BUILD_TAG = "b29-drag"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -817,23 +847,24 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     LaunchedEffect(result) { if (result.isNotEmpty()) { delay(8000); result = "" } }
     LaunchedEffect(Unit) { delay(30000); Pref.bump(ctx, stream.type) }
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
+    // swipe left = hide chat / title / gifts, swipe right = show them (swipes are reported by MainActivity)
+    val wPx = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() }
+    val offsetX = remember { Animatable(if (chatHidden) -wPx else 0f) }
+    DisposableEffect(wPx) {
+        SwipeBus.onDrag = { dx ->
+            val base = if (chatHidden) -wPx else 0f
+            scope.launch { offsetX.snapTo((base + dx).coerceIn(-wPx, 0f)) }
+        }
+        SwipeBus.onRelease = { dx ->
+            val hide = if (chatHidden) !(dx > wPx * 0.25f) else dx < -wPx * 0.25f
+            chatHidden = hide
+            scope.launch { offsetX.animateTo(if (hide) -wPx else 0f) }
+        }
+        onDispose { SwipeBus.onDrag = null; SwipeBus.onRelease = null }
+    }
     BackHandler(onBack = onBack)
 
-    Box(Modifier.fillMaxSize().background(Color.Black).pointerInput(Unit) {
-        // swipe left = hide chat and message bar, swipe right = show them again
-        awaitEachGesture {
-            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-            var dx = 0f
-            var dy = 0f
-            do {
-                val ev = awaitPointerEvent(PointerEventPass.Initial)
-                val c = ev.changes.firstOrNull() ?: break
-                dx += c.positionChange().x
-                dy += c.positionChange().y
-            } while (ev.changes.any { it.pressed })
-            if (Math.abs(dx) > 120f && Math.abs(dx) > Math.abs(dy) * 1.5f) chatHidden = dx < 0
-        }
-    }) {
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
             Box(Modifier.weight(1f).fillMaxHeight()) {
                 if (yt != null) YtView(Modifier.fillMaxSize(), false, yt)
@@ -857,8 +888,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
-            if (!chatHidden) Text("${stream.title} • 👁 $viewers", color = Color.White,
-                modifier = Modifier.clickable { showViewers = true }.padding(12.dp))
+            Text("${stream.title} • 👁 $viewers", color = Color.White,
+                modifier = Modifier
+                    .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }
+                    .clickable { showViewers = true }.padding(12.dp))
             pk?.let { PkBoard(it[0], it[1], it[2], stream.host, guestName, Modifier.fillMaxWidth()) }
             if (result.isNotEmpty()) Text(result, color = Color.White,
                 style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(12.dp))
@@ -867,12 +900,13 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             remember(viewers, showViewers) { viewerNames(lk) + "$user (you)" }) { showViewers = false }
         if (ended) Text("Stream ended", color = Color.White, modifier = Modifier.align(Alignment.Center))
         else if (status.isNotEmpty()) Text(status, color = Color.White, modifier = Modifier.align(Alignment.Center))
-        Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (pk != null && !chatHidden) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
+            .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }) {
+            if (pk != null) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SideBtn("Support ${stream.host}", side == "L") { side = "L" }
                 SideBtn("Support $guestName", side == "R") { side = "R" }
             }
-            if (!chatHidden) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("❤️", "🌹", "🚀").forEach { g ->
                     FilledTonalButton({
                         msgs.addCapped("$user sent $g")
@@ -880,12 +914,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     }) { Text(g) }
                 }
             }
-            AnimatedVisibility(!chatHidden) {
-                ChatOverlay(msgs, onSend = {
-                    msgs.addCapped("$user: $it")
-                    scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
-                })
-            }
+            ChatOverlay(msgs, onSend = {
+                msgs.addCapped("$user: $it")
+                scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
+            })
         }
     }
 }
