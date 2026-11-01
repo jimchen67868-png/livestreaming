@@ -568,7 +568,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b36-smooth"
+const val BUILD_TAG = "b37-nozoom"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -878,7 +878,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     val fr = ratioValue(stream.ratio)
                     val framed = fr != null && screenV == null && !fillMode
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        VideoView(lk, screenV ?: hostV, if (framed) Modifier.aspectRatio(fr!!) else Modifier.fillMaxSize(),
+                        // shared screen: no forced size, so the view measures itself to the picture's own shape (Fit) and nothing is zoomed
+                        VideoView(lk, screenV ?: hostV, if (screenV != null) Modifier else if (framed) Modifier.aspectRatio(fr!!) else Modifier.fillMaxSize(),
                             scaleFill = if (screenV != null) false else if (framed || fillMode) true else null)
                     }
                 }
