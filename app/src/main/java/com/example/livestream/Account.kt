@@ -54,7 +54,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                     msg = if (path == "resend") "A new code was sent to $email" else "We emailed a 6-digit code to $email"
                 }
             } catch (e: Exception) {
-                msg = "Can't reach server"
+                msg = "Can't reach $server (${e.javaClass.simpleName}: ${e.message})"
             }
             busy = false
         }
