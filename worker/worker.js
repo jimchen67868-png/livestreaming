@@ -178,10 +178,10 @@ export default {
           const owner = await env.DB.get('u:' + name.toLowerCase(), 'json');
           if (owner && owner.email !== email) return json({ error: 'That display name is taken' }, 409);
           if (acc && acc.name && acc.name.toLowerCase() !== name.toLowerCase()) await env.DB.delete('u:' + acc.name.toLowerCase());
-          // one new account per device per 31 days (and a loose cap per network per day, which many phones can share)
+          // one new account per device per 30 days (and a loose cap per network per day, which many phones can share)
           const dev = String(b.device || '').slice(0, 64);
           if (!dev) return json({ error: 'Update the app to register' }, 400);
-          if (!(await dailyLimit(env, 'd:' + dev, 1, email, 31))) return json({ error: 'Only one account can be registered per 31 days on this phone. Try again later.' }, 429);
+          if (!(await dailyLimit(env, 'd:' + dev, 1, email, 30))) return json({ error: 'Only one account can be registered per 30 days on this phone. Try again later.' }, 429);
           if (!(await dailyLimit(env, 'i:' + (req.headers.get('CF-Connecting-IP') || 'x'), 5, email, 1))) return json({ error: 'Too many accounts were registered from this network today. Try again tomorrow.' }, 429);
           const salt = crypto.getRandomValues(new Uint8Array(16));
           await env.DB.put(ek, JSON.stringify({ name, email, salt: b64u(salt), hash: await pbkdf2(pw, salt), verified: false, created: Date.now() }));
