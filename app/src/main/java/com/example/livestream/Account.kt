@@ -51,7 +51,9 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                 else if (o.has("error")) msg = o.getString("error")
                 else if (o.optBoolean("verify")) {
                     mode = "verify"
-                    msg = if (path == "resend") "A new code was sent to $email" else "We emailed a 6-digit code to $email"
+                    msg = if (path == "resend" && o.optBoolean("sent")) "A new code was sent to $email"
+                    else if (path == "resend") "Your code was already sent and is valid for 15 minutes. Check your email and spam folder."
+                    else "Enter the 6-digit code emailed to $email (valid for 15 minutes)"
                 }
             } catch (e: Exception) {
                 msg = "Can't reach $server (${e.javaClass.simpleName}: ${e.message})"
@@ -74,7 +76,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button({ call("verify", JSONObject().put("email", em).put("code", code)) }, enabled = !busy && code.length == 6) { Text("Verify") }
-                        OutlinedButton({ call("resend", JSONObject().put("email", em)) }, enabled = !busy) { Text("Send a new code") }
+                        OutlinedButton({ call("resend", JSONObject().put("email", em)) }, enabled = !busy) { Text("Code expired? Get new code") }
                     }
                 } else {
                     OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true,
@@ -94,7 +96,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                         Text(if (mode == "login") "No account? Register" else "Have an account? Log in")
                     }
                 }
-                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("We emailed") || msg.startsWith("A new code")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("Enter the 6-digit") || msg.startsWith("A new code") || msg.startsWith("Your code was")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             }
         },
         confirmButton = {

@@ -104,7 +104,9 @@ const pbkdf2 = async (password, salt) => {
   return b64u(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, k, 256));
 };
 // Emails a 6-digit code (Brevo API). At most one per minute per address.
+// Returns false (and sends nothing) while an earlier code is still valid (15 minutes); true when a new email was sent.
 const sendCode = async (env, email) => {
+  if (await env.DB.get('v:' + email)) return false;
   if (!env.BREVO_KEY || !env.MAIL_FROM) throw new Error('Email sending is not set up on the server (BREVO_KEY and MAIL_FROM).');
   if (await env.DB.get('rl:' + email)) throw new Error('Wait a minute before asking for another code');
   const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
@@ -115,8 +117,9 @@ const sendCode = async (env, email) => {
       subject: 'Your verification code', textContent: 'Your Livestream verification code is ' + code + '. It expires in 15 minutes.' }),
   });
   if (!r.ok) throw new Error('Could not send the email (check BREVO_KEY and that MAIL_FROM is a verified sender)');
-  await env.DB.put('v:' + email, JSON.stringify({ code, tries: 0 }), { expirationTtl: 900 });
+  await env.DB.put('v:' + email, JSON.stringify({ code, tries: 0, exp: Date.now() + 900000 }), { expirationTtl: 900 });
   await env.DB.put('rl:' + email, '1', { expirationTtl: 60 });
+  return true;
 };
 const unb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
 const newSession = async (env, name) => {
@@ -179,20 +182,25 @@ export default {
         }
         if (u.pathname === '/resend') {
           if (!acc || acc.verified) return json({ error: 'Nothing to verify for this email' }, 400);
-          await sendCode(env, email);
-          return json({ verify: true });
+          const lv = await env.DB.get('v:' + email, 'json');
+          if (lv && (lv.tries || 0) >= 5)
+            return json({ error: 'Too many wrong codes. Try again in ' + Math.max(1, Math.ceil(((lv.exp || Date.now()) - Date.now()) / 60000)) + ' minutes.' }, 429);
+          return json({ verify: true, sent: await sendCode(env, email) });
         }
         // /verify
         if (!acc) return json({ error: 'No account for this email' }, 404);
         if (!acc.verified) {
           const vk = 'v:' + email;
           const v = await env.DB.get(vk, 'json');
-          if (!v) return json({ error: 'Code expired. Tap "Send a new code".' }, 400);
-          if (v.tries >= 5) { await env.DB.delete(vk); return json({ error: 'Too many wrong codes. Tap "Send a new code".' }, 429); }
+          if (!v) return json({ error: 'Code expired. Tap "Code expired? Get new code".' }, 400);
+          const left = () => Math.max(1, Math.ceil(((v.exp || Date.now()) - Date.now()) / 60000));
+          const locked = () => json({ error: 'Too many wrong codes. Try again in ' + left() + ' minutes.' }, 429);
+          if ((v.tries || 0) >= 5) return locked();
           if (String(b.code || '').trim() !== v.code) {
             v.tries = (v.tries || 0) + 1;
-            await env.DB.put(vk, JSON.stringify(v), { expirationTtl: 900 });
-            return json({ error: 'Wrong code' }, 400);
+            // keep the original expiry: a wrong code never extends the 15 minutes
+            await env.DB.put(vk, JSON.stringify(v), { expirationTtl: Math.max(60, Math.ceil(((v.exp || Date.now()) - Date.now()) / 1000)) });
+            return v.tries >= 5 ? locked() : json({ error: 'Wrong code (' + (5 - v.tries) + ' tries left)' }, 400);
           }
           acc.verified = true;
           await env.DB.put(ek, JSON.stringify(acc));
