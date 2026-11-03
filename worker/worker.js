@@ -223,7 +223,6 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'w54-onecode' });
       if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b59', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);
