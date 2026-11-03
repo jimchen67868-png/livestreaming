@@ -160,6 +160,7 @@ export default {
           const name = String(b.name || '').trim();
           if (pw.length < 6 || pw.length > 100) return json({ error: 'Password: at least 6 characters' }, 400);
           if (!NAME_RE.test(name)) return json({ error: 'Display name: 3-16 letters, numbers or _' }, 400);
+          if (/^guest\d{4}$/i.test(name)) return json({ error: 'That display name is reserved for guests' }, 400);
           if (acc && acc.verified) return json({ error: 'That email already has an account. Log in instead.' }, 409);
           const owner = await env.DB.get('u:' + name.toLowerCase(), 'json');
           if (owner && owner.email !== email) return json({ error: 'That display name is taken' }, 409);
@@ -221,8 +222,8 @@ export default {
         const rr = ['9:16', '16:9', '1:1'].includes(ratio) ? ratio : 'auto';
         const id = crypto.randomUUID().slice(0, 8);
         const t = String(title || 'Live').slice(0, 60);
-        const h = await nameFor(req, env, String(host || 'guest').slice(0, 20));
-        if (h === null) return json(TAKEN, 403);
+        const h = await userOf(req, env); // only logged-in accounts can host
+        if (!h) return json({ error: 'Log in to go live (the 👤 button on Home).' }, 401);
         await twirp(env, 'CreateRoom', { roomCreate: true },
           { name: id, metadata: JSON.stringify({ title: t, host: h, kind: k, ratio: rr, cc: ccOf(req) }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
@@ -282,8 +283,8 @@ export default {
       if (req.method === 'GET' && u.pathname === '/guest') {
         const room = u.searchParams.get('room');
         const from = u.searchParams.get('from');
-        const name = await nameFor(req, env, (u.searchParams.get('user') || 'guest').slice(0, 20));
-        if (name === null) return json(TAKEN, 403);
+        const name = await userOf(req, env); // only logged-in accounts can join a PK as a guest
+        if (!name) return json({ error: 'Log in to join a PK (the 👤 button on Home).' }, 401);
         const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [room] });
         const r = (d.rooms || [])[0];
         if (!r) return json({ error: 'no room' }, 404);
@@ -296,11 +297,13 @@ export default {
       }
       if (req.method === 'GET' && u.pathname === '/token') {
         const room = u.searchParams.get('room');
-        const name = await nameFor(req, env, (u.searchParams.get('user') || 'guest').slice(0, 20));
+        const acct = await userOf(req, env);
+        const name = acct || (await nameFor(req, env, (u.searchParams.get('user') || 'guest').slice(0, 20)));
         if (name === null) return json(TAKEN, 403);
         if (!room) return json({ error: 'room required' }, 400);
+        // guests can watch; only logged-in accounts can send chat and gifts
         const token = await sign(env, { sub: 'v-' + crypto.randomUUID().slice(0, 8), name,
-          video: { room, roomJoin: true, canPublish: false, canSubscribe: true, canPublishData: true } });
+          video: { room, roomJoin: true, canPublish: false, canSubscribe: true, canPublishData: !!acct } });
         return json({ url: env.LK_WS, token });
       }
       return json({ error: 'not found' }, 404);

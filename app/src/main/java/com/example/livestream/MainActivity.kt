@@ -135,7 +135,8 @@ class MainActivity : ComponentActivity() {
         note("create", now() + " restored=" + (savedInstanceState != null))
         LocalGuard.load(applicationContext)
         GenderGuard.load(applicationContext)
-        setContent { MaterialTheme(colorScheme = darkColorScheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
+        AppTheme.load(getSharedPreferences("s", 0))
+        setContent { MaterialTheme(colorScheme = AppTheme.scheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
     }
 }
 
@@ -151,9 +152,17 @@ fun App() {
     val ctx = LocalContext.current
     val sp = remember { ctx.getSharedPreferences("s", 0) }
     var server by remember { mutableStateOf(if (DEFAULT_SERVER.isNotBlank()) DEFAULT_SERVER else sp.getString("server", "") ?: "") }
-    var user by remember { mutableStateOf(sp.getString("user", "user" + (100..999).random()) ?: "user") }
+    // guests get a random name (kept on this phone); logged-in accounts use their account name
+    var user by remember { mutableStateOf(sp.getString("acct", "")?.takeIf { it.isNotEmpty() } ?: makeGuestName(sp)) }
     remember { Api.auth = sp.getString("auth", "") ?: ""; true }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+    // dark icons in the status bar on the light Home screen; video screens stay dark
+    val act = ctx as? android.app.Activity
+    SideEffect {
+        act?.window?.let { w ->
+            androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).isAppearanceLightStatusBars = (screen is Screen.Home) && !AppTheme.dark
+        }
+    }
     when (val s = screen) {
         Screen.Home -> HomeScreen(server, user,
             { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
@@ -194,6 +203,8 @@ fun resultText(l: Int, r: Int, ln: String, rn: String) =
     if (l > r) "🏆 $ln wins!" else if (r > l) "🏆 $rn wins!" else "🤝 Draw"
 
 fun viewerCount(room: Room) = room.remoteParticipants.values.count { !isGuest(it.identity?.value) }
+// Guests are named guest1234; the server does not let accounts use such names.
+fun isGuestAccount(n: String) = Regex("(?i)guest\\d{4}").matches(n.removeSuffix(" (you)").trim())
 fun viewerNames(room: Room): List<String> = room.remoteParticipants.values
     .filter { !isHost(it.identity?.value) && !isGuest(it.identity?.value) }
     .map { it.name ?: it.identity?.value ?: "guest" }
@@ -573,7 +584,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b44-server"
+const val BUILD_TAG = "b49-theme"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -652,10 +663,12 @@ fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (names.isEmpty()) Text("No viewers yet")
-                names.forEach { n ->
+                // registered users first, then guests; A-Z inside each group
+                names.sortedWith(compareBy<String>({ isGuestAccount(it) }, { it.lowercase() })).forEach { n ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(n, Modifier.weight(1f))
-                        if (!n.endsWith("(you)")) {
+                        // guests have no profile, so they cannot be followed
+                        if (!n.endsWith("(you)") && !isGuestAccount(n)) {
                             TextButton({ Follows.toggle(fctx, n); tick++ }) {
                                 Text(if (tick >= 0 && Follows.has(fctx, n)) "Following ✓" else "+ Follow")
                             }
@@ -696,7 +709,10 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (Stri
                 .background(Color(0x66000000), RoundedCornerShape(8.dp))
                 .padding(horizontal = 8.dp, vertical = 2.dp))
         }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (Api.auth.isEmpty()) {
+            Text("Log in (👤 on Home) to chat", color = Color.White, modifier = Modifier
+                .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
+        } else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(text, { text = it }, placeholder = { Text("Say something") },
                 singleLine = true, modifier = Modifier.weight(1f))
             Button({ if (text.isNotBlank()) { onSend(text); text = "" } }) { Text("Send") }
@@ -782,6 +798,15 @@ fun clearChatNotification(ctx: Context) {
     } catch (e: Exception) {}
 }
 
+// Random guest name such as guest4821, made once and kept on this phone.
+fun makeGuestName(sp: android.content.SharedPreferences): String {
+    val g = sp.getString("guest", "") ?: ""
+    if (g.isNotEmpty()) return g
+    val n = "guest" + (1000..9999).random()
+    sp.edit().putString("guest", n).apply()
+    return n
+}
+
 // ---------- Home ----------
 @Composable
 fun HomeScreen(
@@ -792,6 +817,7 @@ fun HomeScreen(
     var err by remember { mutableStateOf("") }
     var showDiag by remember { mutableStateOf(false) }
     var showAcct by remember { mutableStateOf(false) }
+    var showTheme by remember { mutableStateOf(false) }
     val hctx = LocalContext.current
     val hsp = remember { hctx.getSharedPreferences("s", 0) }
     var acct by remember { mutableStateOf(hsp.getString("acct", "") ?: "") }
@@ -810,13 +836,13 @@ fun HomeScreen(
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            TextButton({ showTheme = true }) { Text("🎨") }
             TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct") }
             TextButton({ showDiag = true }) { Text("ⓘ") }
         }
         if (DEFAULT_SERVER.isBlank()) OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(user, { onSettings(server, it) }, label = { Text(if (acct.isEmpty()) "Name" else "Name (your account)") },
-            singleLine = true, enabled = acct.isEmpty(), modifier = Modifier.fillMaxWidth())
+        Text(if (acct.isEmpty()) "You are $user (guest)" else "You are $user", style = MaterialTheme.typography.bodySmall)
         if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
         LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(1f),
             horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -835,13 +861,16 @@ fun HomeScreen(
                 }
             }
         }
-        Button(onGoLive, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) { Text("Go Live") }
+        Button({ if (acct.isEmpty()) showAcct = true else onGoLive() }, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) {
+            Text(if (acct.isEmpty()) "Log in to Go Live" else "Go Live")
+        }
+        if (showTheme) ThemeDialog(hsp) { showTheme = false }
         if (showAcct) AccountDialog(server, acct, { token, name ->
             Api.auth = token
             acct = name
             hsp.edit().putString("auth", token).putString("acct", name).apply()
             // logged in: the account name is your name; logged out: back to a guest name
-            onSettings(server, if (name.isNotEmpty()) name else "user" + (100..999).random())
+            onSettings(server, if (name.isNotEmpty()) name else makeGuestName(hsp))
             showAcct = false
         }) { showAcct = false }
         if (showDiag) AlertDialog(
@@ -985,7 +1014,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 verticalAlignment = Alignment.CenterVertically) {
                 Text("${stream.title} • 👁 $viewers", color = Color.White,
                     modifier = Modifier.weight(1f).clickable { showViewers = true }.padding(12.dp))
-                if (!stream.host.isNullOrBlank() && !stream.host.equals(user, ignoreCase = true)) {
+                if (!stream.host.isNullOrBlank() && !isGuestAccount(stream.host) && !stream.host.equals(user, ignoreCase = true)) {
                     var followHost by remember(stream.host) { mutableStateOf(Follows.has(ctx, stream.host)) }
                     OutlinedButton({ followHost = Follows.toggle(ctx, stream.host) },
                         contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.padding(end = 8.dp)) {
