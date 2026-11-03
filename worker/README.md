@@ -7,3 +7,10 @@
    LK_WS = wss://YOUR-PROJECT.livekit.cloud
    LK_HOST = https://YOUR-PROJECT.livekit.cloud
 4. In the app, set Server URL to your worker address (https://NAME.SUBDOMAIN.workers.dev).
+
+# Accounts: email + password + emailed code (optional)
+Without these steps the app works as guest only.
+A. Account storage: Cloudflare -> Storage & Databases -> KV -> Create namespace. Worker -> Settings -> Bindings -> Add -> KV namespace, variable name DB.
+B. Email sending (free, no domain needed): brevo.com -> sign up -> Senders, Domains -> add and verify one sender email address (the code goes from it).
+   Then SMTP & API -> API Keys -> Generate. In the Worker add variables: BREVO_KEY = that API key (type Secret), MAIL_FROM = the verified sender email.
+C. Redeploy worker.js. In the app tap the 👤 button on Home -> Register (email, password, display name) -> enter the 6-digit code from your email.

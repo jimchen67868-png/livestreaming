@@ -150,8 +150,9 @@ sealed interface Screen {
 fun App() {
     val ctx = LocalContext.current
     val sp = remember { ctx.getSharedPreferences("s", 0) }
-    var server by remember { mutableStateOf(sp.getString("server", "") ?: "") }
+    var server by remember { mutableStateOf(if (DEFAULT_SERVER.isNotBlank()) DEFAULT_SERVER else sp.getString("server", "") ?: "") }
     var user by remember { mutableStateOf(sp.getString("user", "user" + (100..999).random()) ?: "user") }
+    remember { Api.auth = sp.getString("auth", "") ?: ""; true }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     when (val s = screen) {
         Screen.Home -> HomeScreen(server, user,
@@ -572,7 +573,10 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b39-floatchat"
+const val BUILD_TAG = "b44-server"
+
+// Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
+const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
 
 fun exitName(r: Int) = when (r) {
     1 -> "EXIT_SELF"; 2 -> "SIGNALED"; 3 -> "LOW_MEMORY"; 4 -> "CRASH"; 5 -> "CRASH_NATIVE"; 6 -> "ANR"
@@ -639,6 +643,8 @@ fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onR
 
 @Composable
 fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
+    val fctx = LocalContext.current
+    var tick by remember { mutableStateOf(0) }
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
@@ -646,7 +652,16 @@ fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (names.isEmpty()) Text("No viewers yet")
-                names.forEach { Text(it) }
+                names.forEach { n ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(n, Modifier.weight(1f))
+                        if (!n.endsWith("(you)")) {
+                            TextButton({ Follows.toggle(fctx, n); tick++ }) {
+                                Text(if (tick >= 0 && Follows.has(fctx, n)) "Following ✓" else "+ Follow")
+                            }
+                        }
+                    }
+                }
             }
         }
     )
@@ -776,9 +791,12 @@ fun HomeScreen(
     var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
     var showDiag by remember { mutableStateOf(false) }
+    var showAcct by remember { mutableStateOf(false) }
     val hctx = LocalContext.current
+    val hsp = remember { hctx.getSharedPreferences("s", 0) }
+    var acct by remember { mutableStateOf(hsp.getString("acct", "") ?: "") }
     val sorted = remember(streams) {
-        streams.sortedWith(compareByDescending<Api.Stream> { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
+        streams.sortedWith(compareByDescending<Api.Stream> { Follows.has(hctx, it.host) }.thenByDescending { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
     }
     LaunchedEffect(server) {
         while (true) {
@@ -792,12 +810,13 @@ fun HomeScreen(
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct") }
             TextButton({ showDiag = true }) { Text("ⓘ") }
         }
-        OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
+        if (DEFAULT_SERVER.isBlank()) OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(user, { onSettings(server, it) }, label = { Text("Name") },
-            singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(user, { onSettings(server, it) }, label = { Text(if (acct.isEmpty()) "Name" else "Name (your account)") },
+            singleLine = true, enabled = acct.isEmpty(), modifier = Modifier.fillMaxWidth())
         if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
         LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(1f),
             horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -811,12 +830,20 @@ fun HomeScreen(
                         contentAlignment = Alignment.Center) { Text(if (r.kind == "audio") "🎙" else "📺") }
                     Column(Modifier.padding(10.dp)) {
                         Text(r.title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-                        Text("${flag(r.cc)}${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
+                        Text("${if (Follows.has(hctx, r.host)) "⭐" else ""}${flag(r.cc)}${LiveType.icon(r.type)}${r.host} • 👁 ${r.viewers}", style = MaterialTheme.typography.bodySmall, maxLines = 1)
                     }
                 }
             }
         }
         Button(onGoLive, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) { Text("Go Live") }
+        if (showAcct) AccountDialog(server, acct, { token, name ->
+            Api.auth = token
+            acct = name
+            hsp.edit().putString("auth", token).putString("acct", name).apply()
+            // logged in: the account name is your name; logged out: back to a guest name
+            onSettings(server, if (name.isNotEmpty()) name else "user" + (100..999).random())
+            showAcct = false
+        }) { showAcct = false }
         if (showDiag) AlertDialog(
             onDismissRequest = { showDiag = false },
             title = { Text("Diagnostics") },
@@ -953,10 +980,19 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
-            Text("${stream.title} • 👁 $viewers", color = Color.White,
-                modifier = Modifier
-                    .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }
-                    .clickable { showViewers = true }.padding(12.dp))
+            Row(Modifier.fillMaxWidth()
+                .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("${stream.title} • 👁 $viewers", color = Color.White,
+                    modifier = Modifier.weight(1f).clickable { showViewers = true }.padding(12.dp))
+                if (!stream.host.isNullOrBlank() && !stream.host.equals(user, ignoreCase = true)) {
+                    var followHost by remember(stream.host) { mutableStateOf(Follows.has(ctx, stream.host)) }
+                    OutlinedButton({ followHost = Follows.toggle(ctx, stream.host) },
+                        contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.padding(end = 8.dp)) {
+                        Text(if (followHost) "Following ✓" else "+ Follow")
+                    }
+                }
+            }
             pk?.let { PkBoard(it[0], it[1], it[2], stream.host, guestName, Modifier.fillMaxWidth()) }
             if (result.isNotEmpty()) Text(result, color = Color.White,
                 style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(12.dp))

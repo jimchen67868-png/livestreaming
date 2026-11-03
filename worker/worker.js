@@ -1,6 +1,8 @@
 // Cloudflare Worker: issues LiveKit tokens and lists live rooms.
 // Variables to set in Cloudflare (Settings > Variables and Secrets):
 //   LK_KEY, LK_SECRET (secret), LK_WS = wss://YOUR.livekit.cloud, LK_HOST = https://YOUR.livekit.cloud
+// Accounts: see README (KV binding DB, BREVO_KEY, MAIL_FROM)
+//   (Worker > Settings > Bindings > Add > KV namespace). Without it, the app still works as guest only.
 const enc = new TextEncoder();
 const b64u = (buf) => {
   let s = '';
@@ -94,10 +96,113 @@ const ccOf = (req) => {
 const json = (o, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 
+// ---------- accounts: email + password + emailed code (needs KV namespace bound as DB, and BREVO_KEY + MAIL_FROM) ----------
+const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const pbkdf2 = async (password, salt) => {
+  const k = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  return b64u(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, k, 256));
+};
+// Emails a 6-digit code (Brevo API). At most one per minute per address.
+const sendCode = async (env, email) => {
+  if (!env.BREVO_KEY || !env.MAIL_FROM) throw new Error('Email sending is not set up on the server (BREVO_KEY and MAIL_FROM).');
+  if (await env.DB.get('rl:' + email)) throw new Error('Wait a minute before asking for another code');
+  const code = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
+  const r = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': env.BREVO_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ sender: { email: env.MAIL_FROM, name: 'Livestream' }, to: [{ email }],
+      subject: 'Your verification code', textContent: 'Your Livestream verification code is ' + code + '. It expires in 15 minutes.' }),
+  });
+  if (!r.ok) throw new Error('Could not send the email (check BREVO_KEY and that MAIL_FROM is a verified sender)');
+  await env.DB.put('v:' + email, JSON.stringify({ code, tries: 0 }), { expirationTtl: 900 });
+  await env.DB.put('rl:' + email, '1', { expirationTtl: 60 });
+};
+const unb64u = (t) => Uint8Array.from(atob(t.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+const newSession = async (env, name) => {
+  const p = b64u(enc.encode(JSON.stringify({ u: name, exp: Math.floor(Date.now() / 1000) + 30 * 86400 })));
+  return p + '.' + (await hmac(env, 'sess:' + p));
+};
+// account name of a valid session in the X-Auth header, else null
+const userOf = async (req, env) => {
+  const t = req.headers.get('X-Auth') || '';
+  const i = t.indexOf('.');
+  if (i < 1) return null;
+  const p = t.slice(0, i);
+  if ((await hmac(env, 'sess:' + p)) !== t.slice(i + 1)) return null;
+  try {
+    const o = JSON.parse(new TextDecoder().decode(unb64u(p)));
+    return o.exp > Date.now() / 1000 && o.u ? String(o.u) : null;
+  } catch { return null; }
+};
+// The name to use in a room: the account name if logged in; a guest may not use a registered name (null).
+const nameFor = async (req, env, wanted) => {
+  const a = await userOf(req, env);
+  if (a) return a;
+  if (env.DB && (await env.DB.get('u:' + wanted.toLowerCase()))) return null;
+  return wanted;
+};
+const TAKEN = { error: 'This name belongs to an account. Log in (the 👤 button) or choose another name.' };
+
 export default {
   async fetch(req, env) {
     const u = new URL(req.url);
     try {
+      if (req.method === 'POST' && ['/register', '/login', '/verify', '/resend'].includes(u.pathname)) {
+        if (!env.DB) return json({ error: 'Server has no account storage yet (bind a KV namespace named DB).' }, 503);
+        const b = await req.json();
+        const email = String(b.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email) || email.length > 100) return json({ error: 'Enter a valid email address' }, 400);
+        const ek = 'e:' + email;
+        const acc = await env.DB.get(ek, 'json');
+        if (u.pathname === '/register') {
+          const pw = String(b.password || '');
+          const name = String(b.name || '').trim();
+          if (pw.length < 6 || pw.length > 100) return json({ error: 'Password: at least 6 characters' }, 400);
+          if (!NAME_RE.test(name)) return json({ error: 'Display name: 3-16 letters, numbers or _' }, 400);
+          if (acc && acc.verified) return json({ error: 'That email already has an account. Log in instead.' }, 409);
+          const owner = await env.DB.get('u:' + name.toLowerCase(), 'json');
+          if (owner && owner.email !== email) return json({ error: 'That display name is taken' }, 409);
+          if (acc && acc.name && acc.name.toLowerCase() !== name.toLowerCase()) await env.DB.delete('u:' + acc.name.toLowerCase());
+          const salt = crypto.getRandomValues(new Uint8Array(16));
+          await env.DB.put(ek, JSON.stringify({ name, email, salt: b64u(salt), hash: await pbkdf2(pw, salt), verified: false, created: Date.now() }));
+          await env.DB.put('u:' + name.toLowerCase(), JSON.stringify({ name, email }));
+          await sendCode(env, email);
+          return json({ verify: true });
+        }
+        if (u.pathname === '/login') {
+          if (!acc || (await pbkdf2(String(b.password || ''), unb64u(acc.salt))) !== acc.hash)
+            return json({ error: 'Wrong email or password' }, 401);
+          if (!acc.verified) { try { await sendCode(env, email); } catch {} return json({ verify: true }); }
+          return json({ name: acc.name, token: await newSession(env, acc.name) });
+        }
+        if (u.pathname === '/resend') {
+          if (!acc || acc.verified) return json({ error: 'Nothing to verify for this email' }, 400);
+          await sendCode(env, email);
+          return json({ verify: true });
+        }
+        // /verify
+        if (!acc) return json({ error: 'No account for this email' }, 404);
+        if (!acc.verified) {
+          const vk = 'v:' + email;
+          const v = await env.DB.get(vk, 'json');
+          if (!v) return json({ error: 'Code expired. Tap "Send a new code".' }, 400);
+          if (v.tries >= 5) { await env.DB.delete(vk); return json({ error: 'Too many wrong codes. Tap "Send a new code".' }, 429); }
+          if (String(b.code || '').trim() !== v.code) {
+            v.tries = (v.tries || 0) + 1;
+            await env.DB.put(vk, JSON.stringify(v), { expirationTtl: 900 });
+            return json({ error: 'Wrong code' }, 400);
+          }
+          acc.verified = true;
+          await env.DB.put(ek, JSON.stringify(acc));
+          await env.DB.delete(vk);
+        }
+        return json({ name: acc.name, token: await newSession(env, acc.name) });
+      }
+      if (req.method === 'GET' && u.pathname === '/me') {
+        const a = await userOf(req, env);
+        return a ? json({ name: a }) : json({ error: 'not logged in' }, 401);
+      }
       if (req.method === 'GET' && u.pathname === '/rooms') {
         const d = await twirp(env, 'ListRooms', { roomList: true }, {});
         const out = (d.rooms || [])
@@ -116,7 +221,8 @@ export default {
         const rr = ['9:16', '16:9', '1:1'].includes(ratio) ? ratio : 'auto';
         const id = crypto.randomUUID().slice(0, 8);
         const t = String(title || 'Live').slice(0, 60);
-        const h = String(host || 'guest').slice(0, 20);
+        const h = await nameFor(req, env, String(host || 'guest').slice(0, 20));
+        if (h === null) return json(TAKEN, 403);
         await twirp(env, 'CreateRoom', { roomCreate: true },
           { name: id, metadata: JSON.stringify({ title: t, host: h, kind: k, ratio: rr, cc: ccOf(req) }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
@@ -176,7 +282,8 @@ export default {
       if (req.method === 'GET' && u.pathname === '/guest') {
         const room = u.searchParams.get('room');
         const from = u.searchParams.get('from');
-        const name = (u.searchParams.get('user') || 'guest').slice(0, 20);
+        const name = await nameFor(req, env, (u.searchParams.get('user') || 'guest').slice(0, 20));
+        if (name === null) return json(TAKEN, 403);
         const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [room] });
         const r = (d.rooms || [])[0];
         if (!r) return json({ error: 'no room' }, 404);
@@ -189,7 +296,8 @@ export default {
       }
       if (req.method === 'GET' && u.pathname === '/token') {
         const room = u.searchParams.get('room');
-        const name = (u.searchParams.get('user') || 'guest').slice(0, 20);
+        const name = await nameFor(req, env, (u.searchParams.get('user') || 'guest').slice(0, 20));
+        if (name === null) return json(TAKEN, 403);
         if (!room) return json({ error: 'room required' }, 400);
         const token = await sign(env, { sub: 'v-' + crypto.randomUUID().slice(0, 8), name,
           video: { room, roomJoin: true, canPublish: false, canSubscribe: true, canPublishData: true } });

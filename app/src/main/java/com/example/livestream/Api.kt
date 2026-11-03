@@ -14,6 +14,16 @@ object Api {
 
     private val http = OkHttpClient()
 
+    /** Login session from the server ("" = guest). Sent with room requests so the server knows the account. */
+    @Volatile var auth: String = ""
+
+    /** Account calls (register, login, verify, resend). Returns the server's JSON (it may hold "error", "verify", or "token" + "name"). */
+    fun accountCall(server: String, path: String, body: JSONObject): JSONObject =
+        http.newCall(Request.Builder().url("${base(server)}/$path")
+            .post(body.toString().toRequestBody("application/json".toMediaType())).build()).execute().use { r ->
+            try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject().put("error", "Server error " + r.code) }
+        }
+
     private fun base(s: String): String {
         val t = s.trim().trimEnd('/')
         return if (t.startsWith("http")) t else "https://$t"
@@ -31,9 +41,10 @@ object Api {
     fun createRoom(server: String, title: String, user: String, kind: String = "live", ratio: String = "auto"): Join {
         val body = JSONObject().put("title", title).put("host", user).put("kind", kind).put("ratio", ratio).toString()
             .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url("${base(server)}/rooms").post(body).build()
+        val req = Request.Builder().url("${base(server)}/rooms").header("X-Auth", auth).post(body).build()
         return http.newCall(req).execute().use { r ->
             val o = JSONObject(r.body!!.string())
+            if (o.has("error")) throw Exception(o.getString("error"))
             Join(o.getString("id"), o.getString("url"), o.getString("token"), o.optString("key"))
         }
     }
@@ -64,8 +75,9 @@ object Api {
     fun guestToken(server: String, room: String, from: String, user: String): Join {
         val url = "${base(server)}/guest".toHttpUrl().newBuilder().addQueryParameter("room", room)
             .addQueryParameter("from", from).addQueryParameter("user", user).build()
-        return http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+        return http.newCall(Request.Builder().url(url).header("X-Auth", auth).build()).execute().use { r ->
             val o = JSONObject(r.body!!.string())
+            if (o.has("error")) throw Exception(o.getString("error"))
             Join(room, o.getString("url"), o.getString("token"), o.optString("key"))
         }
     }
@@ -73,8 +85,9 @@ object Api {
     fun viewerToken(server: String, room: String, user: String): Join {
         val url = "${base(server)}/token".toHttpUrl().newBuilder()
             .addQueryParameter("room", room).addQueryParameter("user", user).build()
-        return http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+        return http.newCall(Request.Builder().url(url).header("X-Auth", auth).build()).execute().use { r ->
             val o = JSONObject(r.body!!.string())
+            if (o.has("error")) throw Exception(o.getString("error"))
             Join(room, o.getString("url"), o.getString("token"))
         }
     }
