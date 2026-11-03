@@ -104,10 +104,10 @@ const pbkdf2 = async (password, salt) => {
   return b64u(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, k, 256));
 };
 // Emails a 6-digit code (Brevo API). At most one per minute per address.
-// At most `max` different emails per key (device or network) in 24 hours. The same email trying again is free.
-const dailyLimit = async (env, key, max, email) => {
+// At most `max` different emails per key (device or network) per `days`. The same email trying again is free.
+const dailyLimit = async (env, key, max, email, days) => {
   const k = 'reg:' + key;
-  const v = (await env.DB.get(k, 'json')) || { emails: [], exp: Date.now() + 86400000 };
+  const v = (await env.DB.get(k, 'json')) || { emails: [], exp: Date.now() + days * 86400000 };
   if (v.emails.includes(email)) return true;
   if (v.emails.length >= max) return false;
   v.emails.push(email);
@@ -178,11 +178,11 @@ export default {
           const owner = await env.DB.get('u:' + name.toLowerCase(), 'json');
           if (owner && owner.email !== email) return json({ error: 'That display name is taken' }, 409);
           if (acc && acc.name && acc.name.toLowerCase() !== name.toLowerCase()) await env.DB.delete('u:' + acc.name.toLowerCase());
-          // one new account per device per day (and a loose cap per network, which many phones can share)
+          // one new account per device per 31 days (and a loose cap per network per day, which many phones can share)
           const dev = String(b.device || '').slice(0, 64);
           if (!dev) return json({ error: 'Update the app to register' }, 400);
-          if (!(await dailyLimit(env, 'd:' + dev, 1, email))) return json({ error: 'Only one account can be registered per day on this phone. Try again tomorrow.' }, 429);
-          if (!(await dailyLimit(env, 'i:' + (req.headers.get('CF-Connecting-IP') || 'x'), 5, email))) return json({ error: 'Too many accounts were registered from this network today. Try again tomorrow.' }, 429);
+          if (!(await dailyLimit(env, 'd:' + dev, 1, email, 31))) return json({ error: 'Only one account can be registered per 31 days on this phone. Try again later.' }, 429);
+          if (!(await dailyLimit(env, 'i:' + (req.headers.get('CF-Connecting-IP') || 'x'), 5, email, 1))) return json({ error: 'Too many accounts were registered from this network today. Try again tomorrow.' }, 429);
           const salt = crypto.getRandomValues(new Uint8Array(16));
           await env.DB.put(ek, JSON.stringify({ name, email, salt: b64u(salt), hash: await pbkdf2(pw, salt), verified: false, created: Date.now() }));
           await env.DB.put('u:' + name.toLowerCase(), JSON.stringify({ name, email }));
