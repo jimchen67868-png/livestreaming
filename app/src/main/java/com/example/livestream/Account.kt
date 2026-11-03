@@ -18,6 +18,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -32,8 +33,12 @@ import org.json.JSONObject
 // onDone(token, name): a new session, or ("", "") after logging out.
 @Composable
 fun AccountDialog(server: String, current: String, onDone: (String, String) -> Unit, onClose: () -> Unit) {
-    var mode by remember { mutableStateOf("login") } // login | register | verify
-    var email by remember { mutableStateOf("") }
+    val sp = LocalContext.current.getSharedPreferences("s", 0)
+    // an email that is waiting for its code is remembered, so closing the app does not lose it
+    val pending = sp.getString("pending_email", "") ?: ""
+    val deviceId = sp.getString("device_id", null) ?: java.util.UUID.randomUUID().toString().also { sp.edit().putString("device_id", it).apply() }
+    var mode by remember { mutableStateOf(if (pending.isNotEmpty() && current.isEmpty()) "verify" else "login") } // login | register | verify
+    var email by remember { mutableStateOf(pending) }
     var pass by remember { mutableStateOf("") }
     var display by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
@@ -47,10 +52,11 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
             busy = true; msg = ""
             try {
                 val o = withContext(Dispatchers.IO) { Api.accountCall(server, path, body) }
-                if (o.has("token")) onDone(o.getString("token"), o.optString("name"))
+                if (o.has("token")) { sp.edit().remove("pending_email").apply(); onDone(o.getString("token"), o.optString("name")) }
                 else if (o.has("error")) msg = o.getString("error")
                 else if (o.optBoolean("verify")) {
                     mode = "verify"
+                    sp.edit().putString("pending_email", body.optString("email")).apply()
                     msg = if (path == "resend" && o.optBoolean("sent")) "A new code was sent to $email"
                     else if (path == "resend") "Your code was already sent and is valid for 15 minutes. Check your email and spam folder."
                     else "Enter the 6-digit code emailed to $email (valid for 15 minutes)"
@@ -78,6 +84,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                         Button({ call("verify", JSONObject().put("email", em).put("code", code)) }, enabled = !busy && code.length == 6) { Text("Verify") }
                         OutlinedButton({ call("resend", JSONObject().put("email", em)) }, enabled = !busy) { Text("Code expired? Get new code") }
                     }
+                    TextButton({ sp.edit().remove("pending_email").apply(); mode = "login"; code = ""; msg = "" }) { Text("Use a different email") }
                 } else {
                     OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true,
                         modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email))
@@ -87,7 +94,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                     if (mode == "register") OutlinedTextField(display, { display = it }, singleLine = true,
                         label = { Text("Display name (3-16: letters, numbers, _)") }, modifier = Modifier.fillMaxWidth())
                     if (mode == "register")
-                        Button({ call("register", JSONObject().put("email", em).put("password", pass).put("name", display.trim())) },
+                        Button({ call("register", JSONObject().put("email", em).put("password", pass).put("name", display.trim()).put("device", deviceId)) },
                             enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Register") }
                     else
                         Button({ call("login", JSONObject().put("email", em).put("password", pass)) },
