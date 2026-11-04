@@ -584,7 +584,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b63-devsoundonly"
+const val BUILD_TAG = "b64-diagfix"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1131,7 +1131,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     screenTrack = tr; sharing = true
                     // also share the phone's own sound; the result goes to the ⓘ diagnostics
                     val da = startDeviceAudio(tr)
-                    ctx.getSharedPreferences("s", 0).edit().putString("devaudio", java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " + da).apply()
+                    ctx.getSharedPreferences("diag", 0).edit().putString("devaudio", java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " + da).apply()
                     if (da != "ok") notice = "Phone sound is not shared: $da"
                     else {
                         voicePre = muted
