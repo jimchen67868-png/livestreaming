@@ -584,7 +584,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b62-devaudio"
+const val BUILD_TAG = "b63-devsoundonly"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1100,6 +1100,19 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var sharing by remember { mutableStateOf(false) }
     var screenTrack by remember { mutableStateOf<LocalVideoTrack?>(null) }
     var muted by remember { mutableStateOf(false) }
+    // "phone sound only": the mic track stays on so the phone's sound can travel on it, but the microphone itself is silenced
+    var devOnly by remember { mutableStateOf(false) }
+    var voicePre by remember { mutableStateOf(false) }
+    val audioMgr = remember { ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager }
+    DisposableEffect(Unit) { onDispose { try { audioMgr.isMicrophoneMute = false } catch (e: Exception) {} } }
+    LaunchedEffect(sharing) {
+        if (!sharing && devOnly) {
+            devOnly = false
+            try { audioMgr.isMicrophoneMute = false } catch (e: Exception) {}
+            muted = voicePre
+            if (voicePre) { try { lk.localParticipant.setMicrophoneEnabled(false) } catch (e: Exception) {} }
+        }
+    }
     var kind by rememberSaveable { mutableStateOf("live") }
     var ratio by rememberSaveable { mutableStateOf("auto") }
     var ytId by remember { mutableStateOf("") }
@@ -1120,6 +1133,13 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     val da = startDeviceAudio(tr)
                     ctx.getSharedPreferences("s", 0).edit().putString("devaudio", java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " + da).apply()
                     if (da != "ok") notice = "Phone sound is not shared: $da"
+                    else {
+                        voicePre = muted
+                        try { lk.localParticipant.setMicrophoneEnabled(true) } catch (e: Exception) {}
+                        try { audioMgr.isMicrophoneMute = true } catch (e: Exception) {}
+                        devOnly = true; muted = true
+                        notice = "Sharing phone sound (microphone off)"
+                    }
                     if (ytId.isNotEmpty()) {
                         try { lk.send(JSONObject().put("t", "yt").put("id", "")) } catch (e: Exception) {}
                         ytId = ""; ytCmd = null; showYt = false
@@ -1415,7 +1435,10 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
                 OutlinedButton({
                     scope.launch {
-                        try { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
+                        try {
+                            if (devOnly) { audioMgr.isMicrophoneMute = !muted; muted = !muted } // voice on/off, phone sound keeps going
+                            else { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
+                        }
                         catch (e: Exception) { notice = "Microphone error: ${e.message}" }
                     }
                 }, enabled = live) { Text(if (muted) "🔇" else "🎤") }
