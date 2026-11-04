@@ -97,6 +97,8 @@ const json = (o, status = 200) =>
   new Response(JSON.stringify(o), { status, headers: { 'Content-Type': 'application/json' } });
 
 // ---------- accounts: email + password + emailed code (needs KV namespace bound as DB, and BREVO_KEY + MAIL_FROM) ----------
+// lumis the host earns per gift (emoji without the variation selector)
+const GIFT_LUMIS = { '❤': 1, '🌹': 2, '🚀': 5 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const pbkdf2 = async (password, salt) => {
@@ -223,7 +225,56 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b59', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b68', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
+      if (req.method === 'POST' && u.pathname === '/gift') {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const viewer = await userOf(req, env);
+        if (!viewer) return json({ error: 'Log in to send gifts' }, 401);
+        const b = await req.json();
+        const val = GIFT_LUMIS[String(b.g || '').replace(/\uFE0F/g, '')];
+        if (!val) return json({ error: 'unknown gift' }, 400);
+        const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [String(b.room || '')] });
+        const r = (d.rooms || [])[0];
+        if (!r) return json({ error: 'no room' }, 404);
+        const host = String(parseMeta(r).host || '');
+        if (!host || host.toLowerCase() === viewer.toLowerCase()) return json({ error: 'cannot gift this room' }, 400);
+        // at most 500 gifts per viewer per day
+        const ck = 'gc:' + viewer.toLowerCase();
+        const c = (await env.DB.get(ck, 'json')) || { n: 0, exp: Date.now() + 86400000 };
+        if (c.n >= 500) return json({ error: 'daily gift limit reached' }, 429);
+        c.n++;
+        await env.DB.put(ck, JSON.stringify(c), { expirationTtl: Math.max(60, Math.ceil((c.exp - Date.now()) / 1000)) });
+        const lk = 'l:' + host.toLowerCase();
+        const total = (parseInt(await env.DB.get(lk), 10) || 0) + val;
+        await env.DB.put(lk, String(total));
+        return json({ ok: true, lumis: val });
+      }
+      if (req.method === 'GET' && u.pathname === '/wallet') {
+        const a = await userOf(req, env);
+        if (!a) return json({ error: 'not logged in' }, 401);
+        return json({ lumis: parseInt(await env.DB.get('l:' + a.toLowerCase()), 10) || 0 });
+      }
+      // Profile photos (small JPEG, base64) kept in KV per account
+      if (req.method === 'POST' && u.pathname === '/avatar') {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in to set a profile photo' }, 401);
+        const { img } = await req.json();
+        if (typeof img !== 'string' || img.length < 100 || img.length > 30000 || !/^[A-Za-z0-9+/=]+$/.test(img)) return json({ error: 'bad image' }, 400);
+        await env.DB.put('a:' + who.toLowerCase(), img);
+        return json({ ok: true });
+      }
+      if (req.method === 'GET' && u.pathname === '/avatar') {
+        if (!env.DB) return new Response('', { status: 404 });
+        const nm = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20);
+        const v = nm ? await env.DB.get('a:' + nm) : null;
+        if (!v) return new Response('', { status: 404 });
+        const bin = atob(v);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Response(bytes, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=300' } });
+      }
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);
         return a ? json({ name: a }) : json({ error: 'not logged in' }, 401);

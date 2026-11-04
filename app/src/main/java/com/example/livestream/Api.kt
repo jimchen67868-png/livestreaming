@@ -1,5 +1,8 @@
 package com.example.livestream
 
+import android.graphics.BitmapFactory
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -23,6 +26,42 @@ object Api {
             .post(body.toString().toRequestBody("application/json".toMediaType())).build()).execute().use { r ->
             try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject().put("error", "Server error " + r.code) }
         }
+
+    /** Tells the server a gift was sent, so the host earns lumis. Failures are ignored (the gift itself still shows). */
+    fun sendGift(server: String, room: String, g: String) {
+        try {
+            val body = JSONObject().put("room", room).put("g", g).toString().toRequestBody("application/json".toMediaType())
+            http.newCall(Request.Builder().url("${base(server)}/gift").header("X-Auth", auth).post(body).build()).execute().close()
+        } catch (e: Exception) {}
+    }
+
+    /** Lumis balance of the logged-in account, or -1 if it cannot be read. */
+    fun wallet(server: String): Int = try {
+        http.newCall(Request.Builder().url("${base(server)}/wallet").header("X-Auth", auth).build()).execute().use { r ->
+            JSONObject(r.body!!.string()).optInt("lumis", -1)
+        }
+    } catch (e: Exception) { -1 }
+
+    /** The server address, set by the app so small helpers (profile photos) can use it. */
+    @Volatile var serverUrl: String = ""
+
+    /** Profile photo of an account, or null if it has none. */
+    fun fetchAvatar(server: String, name: String): ImageBitmap? = try {
+        val url = "${base(server)}/avatar?u=" + java.net.URLEncoder.encode(name, "UTF-8")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            if (!r.isSuccessful) null
+            else r.body!!.bytes().let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+        }
+    } catch (e: Exception) { null }
+
+    /** Saves the logged-in account's profile photo (base64 JPEG). Returns an error message, or "" when saved. */
+    fun uploadAvatar(server: String, b64: String): String = try {
+        val body = JSONObject().put("img", b64).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/avatar").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            val o = try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject() }
+            if (o.optBoolean("ok")) "" else o.optString("error", "Upload failed")
+        }
+    } catch (e: Exception) { "Can't reach server" }
 
     private fun base(s: String): String {
         val t = s.trim().trimEnd('/')

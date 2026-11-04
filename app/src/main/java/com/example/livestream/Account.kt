@@ -2,6 +2,10 @@ package com.example.livestream
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.text.KeyboardOptions
@@ -33,7 +37,8 @@ import org.json.JSONObject
 // onDone(token, name): a new session, or ("", "") after logging out.
 @Composable
 fun AccountDialog(server: String, current: String, onDone: (String, String) -> Unit, onClose: () -> Unit) {
-    val sp = LocalContext.current.getSharedPreferences("s", 0)
+    val ctx = LocalContext.current
+    val sp = ctx.getSharedPreferences("s", 0)
     // an email that is waiting for its code is remembered, so closing the app does not lose it
     val pending = sp.getString("pending_email", "") ?: ""
     val deviceId = sp.getString("device_id", null) ?: java.util.UUID.randomUUID().toString().also { sp.edit().putString("device_id", it).apply() }
@@ -68,6 +73,18 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
         }
     }
     val em = email.trim()
+    val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            busy = true; msg = ""
+            val r = withContext(Dispatchers.Default) { encodeSquare(ctx, uri, 160, 28000) }
+            if (r == null) msg = "Could not use that picture"
+            else {
+                val err = withContext(Dispatchers.IO) { Api.uploadAvatar(server, r.first) }
+                if (err.isEmpty()) { Avatars.put(current, r.second.asImageBitmap()); msg = "Photo saved" } else msg = err
+            }
+            busy = false
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onClose,
@@ -75,7 +92,9 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (current.isNotEmpty()) {
+                    Avatar(current, 80.dp)
                     Text("You are logged in as $current. This name is yours alone.")
+                    OutlinedButton({ pickPhoto.launch("image/*") }, enabled = !busy) { Text("Change profile photo") }
                 } else if (mode == "verify") {
                     OutlinedTextField(code, { code = it.filter { c -> c.isDigit() }.take(6) }, label = { Text("6-digit code") },
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
@@ -103,7 +122,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                         Text(if (mode == "login") "No account? Register" else "Have an account? Log in")
                     }
                 }
-                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("Enter the 6-digit") || msg.startsWith("A new code") || msg.startsWith("Your code was")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("Enter the 6-digit") || msg == "Photo saved" || msg.startsWith("A new code") || msg.startsWith("Your code was")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             }
         },
         confirmButton = {

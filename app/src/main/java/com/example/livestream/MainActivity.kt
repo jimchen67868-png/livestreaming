@@ -46,6 +46,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
@@ -152,6 +153,7 @@ fun App() {
     val ctx = LocalContext.current
     val sp = remember { ctx.getSharedPreferences("s", 0) }
     var server by remember { mutableStateOf(if (DEFAULT_SERVER.isNotBlank()) DEFAULT_SERVER else sp.getString("server", "") ?: "") }
+    SideEffect { Api.serverUrl = server }
     // guests get a random name (kept on this phone); logged-in accounts use their account name
     var user by remember { mutableStateOf(sp.getString("acct", "")?.takeIf { it.isNotEmpty() } ?: makeGuestName(sp)) }
     remember { Api.auth = sp.getString("auth", "") ?: ""; true }
@@ -194,6 +196,10 @@ fun chatLine(name: String, o: JSONObject): String? = when (o.optString("t")) {
 
 fun parseJson(b: ByteArray): JSONObject? = try { JSONObject(String(b)) } catch (e: Exception) { null }
 fun MutableList<String>.addCapped(s: String) { add(s); while (size > 50) removeAt(0) }
+// Gifts the host sends to a viewer (viewers send ❤️ 🌹 🚀 to the host).
+val HOST_GIFTS = listOf("🎁", "🍬", "🏆", "💖", "🎉")
+// Lumis the host earns per gift (the server uses the same amounts)
+fun lumisValue(g: String) = when (g.replace("\uFE0F", "")) { "❤" -> 1; "🌹" -> 2; "🚀" -> 5; else -> 0 }
 fun giftValue(g: String) = when (g) { "🌹" -> 5; "🚀" -> 20; else -> 1 }
 fun isGuest(id: String?) = id?.startsWith("guest-") == true
 fun isHost(id: String?) = id?.startsWith("host-") == true
@@ -584,7 +590,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b61-nofloatsend"
+const val BUILD_TAG = "b68-photos"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -653,9 +659,10 @@ fun VideoView(room: Room, track: VideoTrack?, modifier: Modifier = Modifier, onR
 }
 
 @Composable
-fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
+fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = null, onClose: () -> Unit) {
     val fctx = LocalContext.current
     var tick by remember { mutableStateOf(0) }
+    var giftFor by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
@@ -666,13 +673,22 @@ fun ViewerListDialog(names: List<String>, onClose: () -> Unit) {
                 // registered users first, then guests; A-Z inside each group
                 names.sortedWith(compareBy<String>({ isGuestAccount(it) }, { it.lowercase() })).forEach { n ->
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(n.removeSuffix(" (you)"), 30.dp)
+                        Spacer(Modifier.width(8.dp))
                         Text(n, Modifier.weight(1f))
+                        // the host can send a gift to a viewer (a different set from the gifts viewers send to the host)
+                        if (onGift != null && !n.endsWith("(you)")) {
+                            TextButton({ giftFor = if (giftFor == n) "" else n }) { Text("🎁") }
+                        }
                         // guests have no profile, so they cannot be followed
-                        if (!n.endsWith("(you)") && !isGuestAccount(n)) {
+                        if (Api.auth.isNotEmpty() && !n.endsWith("(you)") && !isGuestAccount(n)) {
                             TextButton({ Follows.toggle(fctx, n); tick++ }) {
                                 Text(if (tick >= 0 && Follows.has(fctx, n)) "Following ✓" else "+ Follow")
                             }
                         }
+                    }
+                    if (onGift != null && giftFor == n) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        HOST_GIFTS.forEach { g -> FilledTonalButton({ onGift(n, g); giftFor = "" }) { Text(g) } }
                     }
                 }
             }
@@ -817,10 +833,14 @@ fun HomeScreen(
     var err by remember { mutableStateOf("") }
     var showDiag by remember { mutableStateOf(false) }
     var showAcct by remember { mutableStateOf(false) }
+    var lumis by remember { mutableIntStateOf(-1) } // balance of the logged-in account
     var showTheme by remember { mutableStateOf(false) }
     val hctx = LocalContext.current
     val hsp = remember { hctx.getSharedPreferences("s", 0) }
     var acct by remember { mutableStateOf(hsp.getString("acct", "") ?: "") }
+    LaunchedEffect(acct, server) {
+        lumis = if (acct.isNotEmpty() && server.isNotBlank()) withContext(Dispatchers.IO) { Api.wallet(server) } else -1
+    }
     val sorted = remember(streams) {
         streams.sortedWith(compareByDescending<Api.Stream> { Follows.has(hctx, it.host) }.thenByDescending { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
     }
@@ -837,7 +857,7 @@ fun HomeScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
             TextButton({ showTheme = true }) { Text("🎨") }
-            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct") }
+            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct" + (if (lumis >= 0) " 💎$lumis" else "")) }
             TextButton({ showDiag = true }) { Text("ⓘ") }
         }
         if (DEFAULT_SERVER.isBlank()) OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
@@ -895,6 +915,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     val scope = rememberCoroutineScope()
     val lk = remember { LiveKit.create(ctx.applicationContext) }
     val msgs = remember { mutableStateListOf<String>() }
+    val fx = remember { GiftFx() }
     var viewers by remember { mutableIntStateOf(0) }
     var hostV by remember { mutableStateOf<VideoTrack?>(null) }
     var screenV by remember { mutableStateOf<VideoTrack?>(null) }
@@ -905,6 +926,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
     var showViewers by remember { mutableStateOf(false) }
+    var giftPopup by remember { mutableStateOf("") }
+    LaunchedEffect(giftPopup) { if (giftPopup.isNotEmpty()) { delay(3500); giftPopup = "" } }
     var pk by remember { mutableStateOf<List<Int>?>(null) } // l, r, left
     var result by remember { mutableStateOf("") }
     var guestName by remember { mutableStateOf("Guest") }
@@ -933,7 +956,16 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                             val o = parseJson(e.data)
                             val fromHost = isHost(e.participant?.identity?.value)
                             if (o != null) when (o.optString("t")) {
-                                "chat", "gift" -> chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                                "chat", "gift" -> {
+                                    chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                                    if (o.optString("t") == "gift") fx.add(o.optString("g"), e.participant?.name ?: "?")
+                                }
+                                "hgift" -> if (fromHost) {
+                                    fx.add(o.optString("g"), stream.host)
+                                    val to = o.optString("to"); val g = o.optString("g")
+                                    msgs.addCapped("${stream.host} sent $g to $to")
+                                    if (to.equals(user, ignoreCase = true)) giftPopup = "$g ${stream.host} sent you a gift!"
+                                }
                                 "pk" -> if (fromHost) {
                                     if (o.optBoolean("end")) {
                                         result = resultText(o.optInt("l"), o.optInt("r"), stream.host, guestName); pk = null
@@ -1014,7 +1046,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 verticalAlignment = Alignment.CenterVertically) {
                 Text("${stream.title} • 👁 $viewers", color = Color.White,
                     modifier = Modifier.weight(1f).clickable { showViewers = true }.padding(12.dp))
-                if (!stream.host.isNullOrBlank() && !isGuestAccount(stream.host) && !stream.host.equals(user, ignoreCase = true)) {
+                if (Api.auth.isNotEmpty() && !stream.host.isNullOrBlank() && !isGuestAccount(stream.host) && !stream.host.equals(user, ignoreCase = true)) {
                     var followHost by remember(stream.host) { mutableStateOf(Follows.has(ctx, stream.host)) }
                     OutlinedButton({ followHost = Follows.toggle(ctx, stream.host) },
                         contentPadding = PaddingValues(horizontal = 12.dp), modifier = Modifier.padding(end = 8.dp)) {
@@ -1028,6 +1060,9 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
         }
         if (showViewers) ViewerListDialog(
             remember(viewers, showViewers) { viewerNames(lk) + "$user (you)" }) { showViewers = false }
+        GiftOverlay(fx)
+        if (giftPopup.isNotEmpty()) Text(giftPopup, color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.Center)
+            .background(Color(0xAA000000), RoundedCornerShape(16.dp)).padding(horizontal = 20.dp, vertical = 14.dp))
         if (ended) Text("Stream ended", color = Color.White, modifier = Modifier.align(Alignment.Center))
         else if (status.isNotEmpty()) Text(status, color = Color.White, modifier = Modifier.align(Alignment.Center))
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
@@ -1036,11 +1071,16 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 SideBtn("Support ${stream.host}", side == "L") { side = "L" }
                 SideBtn("Support $guestName", side == "R") { side = "R" }
             }
-            Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // guests can watch only: gifts, chat and follow need a login
+            if (Api.auth.isNotEmpty()) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("❤️", "🌹", "🚀").forEach { g ->
                     FilledTonalButton({
                         msgs.addCapped("$user sent $g")
-                        scope.launch { lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side)) }
+                        fx.add(g, user)
+                        scope.launch {
+                            lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side))
+                            withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
+                        }
                     }) { Text(g) }
                 }
             }
@@ -1061,12 +1101,26 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var title by rememberSaveable { mutableStateOf("$user's live") }
     var live by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Ready") }
+    var lumis by remember { mutableIntStateOf(0) } // earned from gifts in this live
     var viewers by remember { mutableIntStateOf(0) }
     var cam by remember { mutableStateOf<LocalVideoTrack?>(null) }
     var showViewers by remember { mutableStateOf(false) }
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var roomId by remember { mutableStateOf("") }
     var hostKey by remember { mutableStateOf("") }
+    // custom cover picture for the Home grid (chosen by the host; replaces the automatic camera picture)
+    var coverB64 by remember { mutableStateOf("") }
+    val pickCover = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            val r = withContext(Dispatchers.Default) { encodeSquare(ctx, uri, 240, 38000) }
+            if (r != null) coverB64 = r.first
+            else android.widget.Toast.makeText(ctx, "Could not use that picture", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+    LaunchedEffect(coverB64, live, roomId) {
+        if (live && roomId.isNotEmpty() && coverB64.isNotEmpty())
+            withContext(Dispatchers.IO) { try { Api.setThumb(server, roomId, coverB64, hostKey) } catch (e: Exception) {} }
+    }
     // swipe left = hide chat and status, swipe right = show them (swipes are reported by MainActivity)
     var chatHidden by rememberSaveable { mutableStateOf(false) }
     val wPx = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() }
@@ -1084,6 +1138,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         onDispose { SwipeBus.onDrag = null; SwipeBus.onRelease = null }
     }
     val msgs = remember { mutableStateListOf<String>() }
+    val fx = remember { GiftFx() }
     // PK
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
     var guestName by remember { mutableStateOf("Guest") }
@@ -1158,6 +1213,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         "chat" -> chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it); notifyChat(ctx, it) }
                         "gift" -> {
                             chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it); notifyChat(ctx, it) }
+                            if (!isGuest(e.participant?.identity?.value)) fx.add(o.optString("g"), e.participant?.name ?: "?")
+                            if (!isGuest(e.participant?.identity?.value)) lumis += lumisValue(o.optString("g"))
                             if (pkActive && !isGuest(e.participant?.identity?.value)) {
                                 val v = giftValue(o.optString("g"))
                                 if (o.optString("s") == "R") scoreR += v else scoreL += v
@@ -1294,7 +1351,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                             } catch (e: Exception) {}
                         } else if (now - lastThumb > 30000) {
                             lastThumb = now
-                            val t = squareThumb(frame)
+                            val t = if (coverB64.isNotEmpty()) coverB64 else squareThumb(frame)
                             val ty = if (pkActive) "pk" else if (sharing) "screen" else withContext(Dispatchers.Default) { LiveType.detect(frame) }
                             withContext(Dispatchers.IO) {
                                 try { Api.setThumb(server, roomId, t, hostKey, ty) } catch (e: Exception) {}
@@ -1326,10 +1383,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
+        GiftOverlay(fx)
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp)
             .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("$status${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers", color = Color.White,
+            Text("$status${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers${if (lumis > 0) " • 💎 $lumis" else ""}", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
                     .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
             if (pkActive) PkBoard(scoreL, scoreR, pkLeft, user, guestName, Modifier.fillMaxWidth())
@@ -1340,12 +1398,17 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             if (!live) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SideBtn("🎥 Live", kind == "live") { kind = "live" }
                 SideBtn("🎙 Audio", kind == "audio") { kind = "audio" }
+                SideBtn("🖼 Cover", coverB64.isNotEmpty()) { pickCover.launch("image/*") }
             }
             if (!live && kind == "live") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (r in listOf("auto", "9:16", "16:9", "1:1")) SideBtn(if (r == "auto") "Auto" else r, ratio == r) { ratio = r }
             }
         }
-        if (showViewers) ViewerListDialog(remember(viewers, showViewers) { viewerNames(lk) }) { showViewers = false }
+        if (showViewers) ViewerListDialog(remember(viewers, showViewers) { viewerNames(lk) }, onGift = { to, g ->
+            msgs.addCapped("You sent $g to $to")
+            fx.add(g, user)
+            scope.launch { lk.send(JSONObject().put("t", "hgift").put("g", g).put("to", to)) }
+        }) { showViewers = false }
         if (showYt) AlertDialog(
             onDismissRequest = { showYt = false },
             title = { Text("Play a YouTube video") },
@@ -1431,6 +1494,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     if (FloatChat.canShow(ctx)) android.widget.Toast.makeText(ctx, "Floating chat is on: it shows when you leave the app", android.widget.Toast.LENGTH_LONG).show()
                     else FloatChat.askPermission(ctx)
                 }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("💬") }
+                OutlinedButton({ pickCover.launch("image/*") }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("🖼") }
             }
         }
     }
