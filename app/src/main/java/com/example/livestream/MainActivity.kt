@@ -145,6 +145,7 @@ sealed interface Screen {
     object Home : Screen
     data class Watch(val stream: Api.Stream) : Screen
     object Live : Screen
+    object Posts : Screen
     data class Guest(val room: String, val from: String) : Screen
 }
 
@@ -162,13 +163,14 @@ fun App() {
     val act = ctx as? android.app.Activity
     SideEffect {
         act?.window?.let { w ->
-            androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).isAppearanceLightStatusBars = (screen is Screen.Home) && !AppTheme.dark
+            androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).isAppearanceLightStatusBars = (screen is Screen.Home || screen is Screen.Posts) && !AppTheme.dark
         }
     }
     when (val s = screen) {
         Screen.Home -> HomeScreen(server, user,
             { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
-            { screen = Screen.Watch(it) }, { screen = Screen.Live })
+            { screen = Screen.Watch(it) }, { screen = Screen.Live }, { screen = Screen.Posts })
+        Screen.Posts -> PostsScreen(server, user) { screen = Screen.Home }
         is Screen.Watch -> key(s.stream.id) {
             WatchScreen(server, user, s.stream, { id -> screen = Screen.Watch(Api.Stream(id, "PK battle", "", 0)) }) {
                 screen = Screen.Home
@@ -188,8 +190,9 @@ suspend fun Room.send(o: JSONObject) {
     localParticipant.publishData(o.toString().toByteArray())
 }
 
-fun chatLine(name: String, o: JSONObject): String? = when (o.optString("t")) {
-    "chat" -> "$name: ${o.optString("text")}"
+// broadcaster = the message comes from the host, whose name is marked "(broadcaster)"
+fun chatLine(name: String, o: JSONObject, broadcaster: Boolean = false): String? = when (o.optString("t")) {
+    "chat" -> "${if (broadcaster) "$name (broadcaster)" else name}: ${o.optString("text")}"
     "gift" -> "$name sent ${o.optString("g")}"
     else -> null
 }
@@ -590,7 +593,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b68-photos"
+const val BUILD_TAG = "b72-goldhost"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -666,24 +669,26 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
-        title = { Text("Viewers (${names.size})") },
+        title = { Text("Viewers (${names.count { !it.endsWith(" (host)") }})") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (names.isEmpty()) Text("No viewers yet")
-                // registered users first, then guests; A-Z inside each group
-                names.sortedWith(compareBy<String>({ isGuestAccount(it) }, { it.lowercase() })).forEach { n ->
+                // host first, then registered users, then guests; A-Z inside each group
+                names.sortedWith(compareBy<String>({ !it.endsWith(" (host)") }, { isGuestAccount(it) }, { it.lowercase() })).forEach { n ->
+                    val clean = n.removeSuffix(" (you)").removeSuffix(" (host)")
+                    val isHostRow = n.endsWith(" (host)")
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(n.removeSuffix(" (you)"), 30.dp)
+                        Avatar(clean, 30.dp)
                         Spacer(Modifier.width(8.dp))
-                        Text(n, Modifier.weight(1f))
+                        Text(if (isHostRow) "\uD83D\uDC51 $n" else n, Modifier.weight(1f))
                         // the host can send a gift to a viewer (a different set from the gifts viewers send to the host)
-                        if (onGift != null && !n.endsWith("(you)")) {
-                            TextButton({ giftFor = if (giftFor == n) "" else n }) { Text("🎁") }
+                        if (onGift != null && !n.endsWith("(you)") && !isHostRow) {
+                            TextButton({ giftFor = if (giftFor == n) "" else n }) { Text("\uD83C\uDF81") }
                         }
                         // guests have no profile, so they cannot be followed
-                        if (Api.auth.isNotEmpty() && !n.endsWith("(you)") && !isGuestAccount(n)) {
-                            TextButton({ Follows.toggle(fctx, n); tick++ }) {
-                                Text(if (tick >= 0 && Follows.has(fctx, n)) "Following ✓" else "+ Follow")
+                        if (Api.auth.isNotEmpty() && !n.endsWith("(you)") && !isGuestAccount(clean)) {
+                            TextButton({ Follows.toggle(fctx, clean); tick++ }) {
+                                Text(if (tick >= 0 && Follows.has(fctx, clean)) "Following \u2713" else "+ Follow")
                             }
                         }
                     }
@@ -721,9 +726,13 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (Stri
     var text by remember { mutableStateOf("") }
     Column(modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         msgs.takeLast(6).forEach {
-            Text(it, color = Color.White, modifier = Modifier
-                .background(Color(0x66000000), RoundedCornerShape(8.dp))
-                .padding(horizontal = 8.dp, vertical = 2.dp))
+            // lines from the host are gold and bold. Only the part before the first ":" is checked, so a viewer cannot fake it in a message.
+            val fromBroadcaster = it.substringBefore(":").contains("(broadcaster)")
+            Text(it, color = if (fromBroadcaster) Color(0xFFFFD54F) else Color.White,
+                fontWeight = if (fromBroadcaster) androidx.compose.ui.text.font.FontWeight.Bold else null,
+                modifier = Modifier
+                    .background(Color(0x66000000), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 2.dp))
         }
         if (Api.auth.isEmpty()) {
             Text("Log in (👤 on Home) to chat", color = Color.White, modifier = Modifier
@@ -827,7 +836,7 @@ fun makeGuestName(sp: android.content.SharedPreferences): String {
 @Composable
 fun HomeScreen(
     server: String, user: String, onSettings: (String, String) -> Unit,
-    onOpen: (Api.Stream) -> Unit, onGoLive: () -> Unit
+    onOpen: (Api.Stream) -> Unit, onGoLive: () -> Unit, onPosts: () -> Unit
 ) {
     var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
@@ -884,6 +893,7 @@ fun HomeScreen(
         Button({ if (acct.isEmpty()) showAcct = true else onGoLive() }, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) {
             Text(if (acct.isEmpty()) "Log in to Go Live" else "Go Live")
         }
+        OutlinedButton(onPosts, Modifier.fillMaxWidth()) { Text("📷 Posts") }
         if (showTheme) ThemeDialog(hsp) { showTheme = false }
         if (showAcct) AccountDialog(server, acct, { token, name ->
             Api.auth = token
@@ -957,13 +967,13 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                             val fromHost = isHost(e.participant?.identity?.value)
                             if (o != null) when (o.optString("t")) {
                                 "chat", "gift" -> {
-                                    chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                                    chatLine(e.participant?.name ?: "?", o, fromHost)?.let { msgs.addCapped(it) }
                                     if (o.optString("t") == "gift") fx.add(o.optString("g"), e.participant?.name ?: "?")
                                 }
                                 "hgift" -> if (fromHost) {
                                     fx.add(o.optString("g"), stream.host)
                                     val to = o.optString("to"); val g = o.optString("g")
-                                    msgs.addCapped("${stream.host} sent $g to $to")
+                                    msgs.addCapped("${stream.host} (broadcaster) sent $g to $to")
                                     if (to.equals(user, ignoreCase = true)) giftPopup = "$g ${stream.host} sent you a gift!"
                                 }
                                 "pk" -> if (fromHost) {
@@ -1059,7 +1069,10 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(12.dp))
         }
         if (showViewers) ViewerListDialog(
-            remember(viewers, showViewers) { viewerNames(lk) + "$user (you)" }) { showViewers = false }
+            remember(viewers, showViewers) {
+                val hn = stream.host.ifBlank { lk.remoteParticipants.values.firstOrNull { isHost(it.identity?.value) }?.name ?: "" }
+                (if (hn.isNotBlank()) listOf("$hn (host)") else emptyList()) + viewerNames(lk) + "$user (you)"
+            }) { showViewers = false }
         GiftOverlay(fx)
         if (giftPopup.isNotEmpty()) Text(giftPopup, color = Color.White, fontSize = 22.sp, modifier = Modifier.align(Alignment.Center)
             .background(Color(0xAA000000), RoundedCornerShape(16.dp)).padding(horizontal = 20.dp, vertical = 14.dp))
@@ -1466,7 +1479,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         }
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
             if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, onSend = {
-                msgs.addCapped("$user: $it")
+                msgs.addCapped("$user (broadcaster): $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1534,7 +1547,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                             val o = parseJson(e.data)
                             val fromHost = isHost(e.participant?.identity?.value)
                             if (o != null) when (o.optString("t")) {
-                                "chat", "gift" -> chatLine(e.participant?.name ?: "?", o)?.let { msgs.addCapped(it) }
+                                "chat", "gift" -> chatLine(e.participant?.name ?: "?", o, fromHost)?.let { msgs.addCapped(it) }
                                 "pk" -> if (fromHost) {
                                     if (o.optBoolean("end")) {
                                         result = resultText(o.optInt("l"), o.optInt("r"), hostName, user); pk = null

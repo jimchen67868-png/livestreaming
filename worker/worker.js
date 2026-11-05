@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b68', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b69', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -274,6 +274,79 @@ export default {
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         return new Response(bytes, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=300' } });
+      }
+      // ---------- posts: a photo or a short video (8 seconds max, checked in the app) ----------
+      if (req.method === 'POST' && u.pathname === '/posts') { // step 1: details + small preview picture
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in to post' }, 401);
+        const b = await req.json();
+        const kind = b.kind === 'video' ? 'video' : 'photo';
+        const thumb = String(b.thumb || '');
+        if (thumb.length < 100 || thumb.length > 40000 || !/^[A-Za-z0-9+/=]+$/.test(thumb)) return json({ error: 'bad preview picture' }, 400);
+        const ck = 'pc:' + who.toLowerCase(); // at most 10 posts per day
+        const c = (await env.DB.get(ck, 'json')) || { n: 0, exp: Date.now() + 86400000 };
+        if (c.n >= 10) return json({ error: 'You can post 10 times per day' }, 429);
+        const sc = await nudityScore(env, thumb);
+        if (sc !== null && sc >= 0.6) return json({ error: 'This picture was refused' }, 400);
+        c.n++;
+        await env.DB.put(ck, JSON.stringify(c), { expirationTtl: Math.max(60, Math.ceil((c.exp - Date.now()) / 1000)) });
+        const id = String(9999999999999 - Date.now()).padStart(13, '0') + Math.random().toString(36).slice(2, 6);
+        await env.DB.put('pt:' + id, thumb);
+        await env.DB.put('pp:' + id, JSON.stringify({ user: who, kind, caption: String(b.caption || '').slice(0, 100) }), { expirationTtl: 3600 });
+        return json({ id });
+      }
+      const pdm = u.pathname.match(/^\/post\/(\w+)\/data$/);
+      if (req.method === 'PUT' && pdm) { // step 2: the photo or video itself
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in to post' }, 401);
+        const id = pdm[1];
+        const pend = await env.DB.get('pp:' + id, 'json');
+        if (!pend || pend.user !== who) return json({ error: 'upload expired, try again' }, 404);
+        const buf = await req.arrayBuffer();
+        if (!buf.byteLength || buf.byteLength > (pend.kind === 'video' ? 12000000 : 600000)) return json({ error: 'file too large' }, 413);
+        const h = new Uint8Array(buf.slice(0, 12));
+        const isJpeg = h[0] === 0xff && h[1] === 0xd8;
+        const isMp4 = h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70;
+        if (pend.kind === 'photo' ? !isJpeg : !isMp4) return json({ error: 'unsupported file (photo: JPEG, video: MP4)' }, 400);
+        await env.DB.put('pd:' + id, buf, { metadata: { k: pend.kind } });
+        await env.DB.put('pm:' + id, '', { metadata: { u: pend.user, k: pend.kind, c: pend.caption, t: Date.now() } });
+        await env.DB.delete('pp:' + id);
+        return json({ ok: true, id });
+      }
+      if (req.method === 'GET' && u.pathname === '/posts') {
+        if (!env.DB) return json([]);
+        const l = await env.DB.list({ prefix: 'pm:', limit: 60 }); // newest first (ids count down)
+        return json(l.keys.map((k) => ({ id: k.name.slice(3), user: (k.metadata || {}).u || '', kind: (k.metadata || {}).k || 'photo',
+          caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0 })));
+      }
+      const pgm = u.pathname.match(/^\/post\/(\w+)(\/thumb)?$/);
+      if (req.method === 'GET' && pgm) {
+        if (!env.DB) return new Response('', { status: 404 });
+        const cache = { 'Cache-Control': 'public, max-age=86400' };
+        if (pgm[2]) {
+          const t = await env.DB.get('pt:' + pgm[1]);
+          if (!t) return new Response('', { status: 404 });
+          const bin = atob(t);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          return new Response(bytes, { headers: { 'Content-Type': 'image/jpeg', ...cache } });
+        }
+        const d = await env.DB.getWithMetadata('pd:' + pgm[1], 'arrayBuffer');
+        if (!d.value) return new Response('', { status: 404 });
+        return new Response(d.value, { headers: { 'Content-Type': (d.metadata || {}).k === 'video' ? 'video/mp4' : 'image/jpeg', ...cache } });
+      }
+      if (req.method === 'DELETE' && pgm && !pgm[2]) {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in' }, 401);
+        const m = await env.DB.getWithMetadata('pm:' + pgm[1]);
+        if (!m.metadata || String(m.metadata.u).toLowerCase() !== who.toLowerCase()) return json({ error: 'not your post' }, 403);
+        await env.DB.delete('pm:' + pgm[1]);
+        await env.DB.delete('pd:' + pgm[1]);
+        await env.DB.delete('pt:' + pgm[1]);
+        return json({ ok: true });
       }
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);

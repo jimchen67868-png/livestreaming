@@ -7,6 +7,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -62,6 +63,62 @@ object Api {
             if (o.optBoolean("ok")) "" else o.optString("error", "Upload failed")
         }
     } catch (e: Exception) { "Can't reach server" }
+
+    data class Post(val id: String, val user: String, val kind: String, val caption: String, val ts: Long)
+
+    // uploads of videos can take a while
+    private val httpLong = http.newBuilder()
+        .callTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(180, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(180, java.util.concurrent.TimeUnit.SECONDS).build()
+
+    /** Newest posts first. */
+    fun posts(server: String): List<Post> = try {
+        http.newCall(Request.Builder().url("${base(server)}/posts").build()).execute().use { r ->
+            val a = JSONArray(r.body!!.string())
+            (0 until a.length()).map {
+                val o = a.getJSONObject(it)
+                Post(o.getString("id"), o.optString("user"), o.optString("kind", "photo"), o.optString("caption"), o.optLong("ts"))
+            }
+        }
+    } catch (e: Exception) { emptyList() }
+
+    /** Step 1 of posting: details and a small preview. Returns the new post id or throws with the server's message. */
+    fun createPost(server: String, kind: String, caption: String, thumbB64: String): String {
+        val body = JSONObject().put("kind", kind).put("caption", caption).put("thumb", thumbB64).toString()
+            .toRequestBody("application/json".toMediaType())
+        return http.newCall(Request.Builder().url("${base(server)}/posts").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            val o = JSONObject(r.body!!.string())
+            if (o.has("error")) throw Exception(o.getString("error"))
+            o.getString("id")
+        }
+    }
+
+    /** Step 2: the photo or video file. Returns "" when saved, otherwise the error message. */
+    fun uploadPostData(server: String, id: String, file: java.io.File): String = try {
+        val body = file.asRequestBody("application/octet-stream".toMediaType())
+        httpLong.newCall(Request.Builder().url("${base(server)}/post/$id/data").header("X-Auth", auth).put(body).build()).execute().use { r ->
+            val o = try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject() }
+            if (o.optBoolean("ok")) "" else o.optString("error", "Upload failed (" + r.code + ")")
+        }
+    } catch (e: Exception) { "Upload failed: " + (e.message ?: "no connection") }
+
+    fun deletePost(server: String, id: String): Boolean = try {
+        http.newCall(Request.Builder().url("${base(server)}/post/$id").header("X-Auth", auth).delete().build()).execute().use { it.isSuccessful }
+    } catch (e: Exception) { false }
+
+    fun fetchBytes(server: String, path: String): ByteArray? = try {
+        httpLong.newCall(Request.Builder().url("${base(server)}/$path").build()).execute().use { r ->
+            if (r.isSuccessful) r.body!!.bytes() else null
+        }
+    } catch (e: Exception) { null }
+
+    fun downloadTo(server: String, path: String, file: java.io.File): Boolean = try {
+        httpLong.newCall(Request.Builder().url("${base(server)}/$path").build()).execute().use { r ->
+            if (!r.isSuccessful) false
+            else { r.body!!.byteStream().use { i -> file.outputStream().use { o -> i.copyTo(o) } }; true }
+        }
+    } catch (e: Exception) { false }
 
     private fun base(s: String): String {
         val t = s.trim().trimEnd('/')
