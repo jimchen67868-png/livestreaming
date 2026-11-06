@@ -593,7 +593,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b72-goldhost"
+const val BUILD_TAG = "b73-profilecover"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1121,14 +1121,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var roomId by remember { mutableStateOf("") }
     var hostKey by remember { mutableStateOf("") }
-    // custom cover picture for the Home grid (chosen by the host; replaces the automatic camera picture)
+    // live cover from the profile page (saved on the account); it replaces the automatic camera picture and cannot be changed during a live
     var coverB64 by remember { mutableStateOf("") }
-    val pickCover = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) scope.launch {
-            val r = withContext(Dispatchers.Default) { encodeSquare(ctx, uri, 240, 38000) }
-            if (r != null) coverB64 = r.first
-            else android.widget.Toast.makeText(ctx, "Could not use that picture", android.widget.Toast.LENGTH_SHORT).show()
-        }
+    LaunchedEffect(Unit) {
+        val bytes = withContext(Dispatchers.IO) { Api.fetchBytes(server, "cover?u=" + java.net.URLEncoder.encode(user, "UTF-8")) }
+        if (bytes != null && bytes.isNotEmpty()) coverB64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
     }
     LaunchedEffect(coverB64, live, roomId) {
         if (live && roomId.isNotEmpty() && coverB64.isNotEmpty())
@@ -1411,7 +1408,6 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             if (!live) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SideBtn("🎥 Live", kind == "live") { kind = "live" }
                 SideBtn("🎙 Audio", kind == "audio") { kind = "audio" }
-                SideBtn("🖼 Cover", coverB64.isNotEmpty()) { pickCover.launch("image/*") }
             }
             if (!live && kind == "live") Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (r in listOf("auto", "9:16", "16:9", "1:1")) SideBtn(if (r == "auto") "Auto" else r, ratio == r) { ratio = r }
@@ -1507,7 +1503,6 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     if (FloatChat.canShow(ctx)) android.widget.Toast.makeText(ctx, "Floating chat is on: it shows when you leave the app", android.widget.Toast.LENGTH_LONG).show()
                     else FloatChat.askPermission(ctx)
                 }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("💬") }
-                OutlinedButton({ pickCover.launch("image/*") }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("🖼") }
             }
         }
     }

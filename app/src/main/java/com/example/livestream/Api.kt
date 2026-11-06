@@ -64,6 +64,15 @@ object Api {
         }
     } catch (e: Exception) { "Can't reach server" }
 
+    /** Saves the account's live cover (base64 JPEG). Returns "" when saved, otherwise the error message. */
+    fun uploadCover(server: String, b64: String): String = try {
+        val body = JSONObject().put("img", b64).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/cover").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            val o = try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject() }
+            if (o.optBoolean("ok")) "" else o.optString("error", "Upload failed")
+        }
+    } catch (e: Exception) { "Can't reach server" }
+
     data class Post(val id: String, val user: String, val kind: String, val caption: String, val ts: Long)
 
     // uploads of videos can take a while

@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b69', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b73', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -347,6 +347,31 @@ export default {
         await env.DB.delete('pd:' + pgm[1]);
         await env.DB.delete('pt:' + pgm[1]);
         return json({ ok: true });
+      }
+      // Live cover picture: set on the profile page (not while live), reused for every live of that account
+      if (req.method === 'POST' && u.pathname === '/cover') {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in to set a cover' }, 401);
+        const { img } = await req.json();
+        if (typeof img !== 'string' || img.length < 100 || img.length > 40000 || !/^[A-Za-z0-9+/=]+$/.test(img)) return json({ error: 'bad image' }, 400);
+        const d = await twirp(env, 'ListRooms', { roomList: true }, {});
+        if ((d.rooms || []).some((r) => String(parseMeta(r).host || '').toLowerCase() === who.toLowerCase()))
+          return json({ error: "You can't change the cover while you are live." }, 409);
+        const sc = await nudityScore(env, img);
+        if (sc !== null && sc >= 0.6) return json({ error: 'This picture was refused' }, 400);
+        await env.DB.put('cv:' + who.toLowerCase(), img);
+        return json({ ok: true });
+      }
+      if (req.method === 'GET' && u.pathname === '/cover') {
+        if (!env.DB) return new Response('', { status: 404 });
+        const nm = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20);
+        const v = nm ? await env.DB.get('cv:' + nm) : null;
+        if (!v) return new Response('', { status: 404 });
+        const bin = atob(v);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Response(bytes, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache' } });
       }
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);

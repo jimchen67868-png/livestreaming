@@ -6,6 +6,13 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.runtime.produceState
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.text.KeyboardOptions
@@ -73,6 +80,20 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
         }
     }
     val em = email.trim()
+    var coverRev by remember { mutableStateOf(0) } // bumps after a new cover is saved, so the preview reloads
+    val pickCover = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            busy = true; msg = ""
+            val r = withContext(Dispatchers.Default) { encodeSquare(ctx, uri, 240, 38000) }
+            if (r == null) msg = "Could not use that picture"
+            else if (LocalGuard.suspicious(r.second)) msg = "This picture looks inappropriate and cannot be used"
+            else {
+                val err = withContext(Dispatchers.IO) { Api.uploadCover(server, r.first) }
+                if (err.isEmpty()) { coverRev++; msg = "Cover saved" } else msg = err
+            }
+            busy = false
+        }
+    }
     val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) scope.launch {
             busy = true; msg = ""
@@ -95,6 +116,17 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                     Avatar(current, 80.dp)
                     Text("You are logged in as $current. This name is yours alone.")
                     OutlinedButton({ pickPhoto.launch("image/*") }, enabled = !busy) { Text("Change profile photo") }
+                    Text("Live cover (shown on Home when you go live, and used for every live)", style = MaterialTheme.typography.bodySmall)
+                    val cover by produceState<ImageBitmap?>(null, current, coverRev) {
+                        value = withContext(Dispatchers.IO) {
+                            Api.fetchBytes(server, "cover?u=" + java.net.URLEncoder.encode(current, "UTF-8"))?.let {
+                                android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap()
+                            }
+                        }
+                    }
+                    cover?.let { Image(it, null, Modifier.size(120.dp).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop) }
+                    OutlinedButton({ pickCover.launch("image/*") }, enabled = !busy) { Text(if (cover == null) "Set live cover" else "Change live cover") }
+                    Text("The cover can only be changed when you are not live.", style = MaterialTheme.typography.bodySmall)
                 } else if (mode == "verify") {
                     OutlinedTextField(code, { code = it.filter { c -> c.isDigit() }.take(6) }, label = { Text("6-digit code") },
                         singleLine = true, modifier = Modifier.fillMaxWidth(),
@@ -122,7 +154,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                         Text(if (mode == "login") "No account? Register" else "Have an account? Log in")
                     }
                 }
-                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("Enter the 6-digit") || msg == "Photo saved" || msg.startsWith("A new code") || msg.startsWith("Your code was")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+                if (msg.isNotEmpty()) Text(msg, color = if (msg.startsWith("Enter the 6-digit") || msg == "Photo saved" || msg == "Cover saved" || msg.startsWith("A new code") || msg.startsWith("Your code was")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
             }
         },
         confirmButton = {
