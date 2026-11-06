@@ -16,8 +16,8 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
-import org.webrtc.VideoFrame
-import org.webrtc.VideoSink
+import livekit.org.webrtc.VideoFrame
+import livekit.org.webrtc.VideoSink
 import java.io.File
 import java.nio.ByteBuffer
 
