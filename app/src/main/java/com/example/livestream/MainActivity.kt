@@ -204,12 +204,14 @@ fun MutableList<String>.addCapped(s: String) { add(s); while (size > 50) removeA
 // Gifts the host sends to a viewer (viewers send ❤️ 🌹 🚀 to the host).
 val HOST_GIFTS = listOf("🎁", "🍬", "🏆", "💖", "🎉")
 // Lumis the host earns per gift (the server uses the same amounts)
-// Gifts viewers can send, with the lumis the host earns (the worker has the same table). Only gifts of 50+ lumis get the full-screen animation; all gifts show the sender banner.
-val VIEWER_GIFTS = listOf("❤️" to 1, "👍" to 1, "🌹" to 2, "☕" to 2, "🍫" to 3, "🚀" to 5, "💍" to 10, "👑" to 20, "🎂" to 30,
-    "🦄" to 50, "🚗" to 80, "🏰" to 100, "🐉" to 200, "🛸" to 500, "🌌" to 1000)
+// Gifts viewers can send (in random order, prices not tied to the picture), with the lumis the host earns (the worker has the same table, 1 to 30000).
+// Animation: under 50 lumis none; 50 to 999 only the gifts in MID_ANIMATED; 1000 and up always. All gifts show the sender banner.
+val VIEWER_GIFTS = listOf("🎇" to 3000, "🐘" to 50, "🐱" to 40, "🎻" to 1000, "🍦" to 15, "🧸" to 20, "🎠" to 15, "💋" to 700, "🎡" to 30, "🦄" to 2000, "🗼" to 2000, "🚗" to 100, "🎆" to 3000, "🌌" to 3, "🚕" to 150, "🎀" to 700, "🎹" to 20000, "🍔" to 5, "🎧" to 80, "🍷" to 40, "💍" to 200, "🍫" to 10, "🦅" to 30000, "🍩" to 20, "🚢" to 2, "🏰" to 20000, "🗽" to 1500, "🍓" to 3, "🌹" to 1, "🛸" to 8, "🎤" to 1000, "📸" to 5, "🌷" to 100, "🌙" to 30, "🌃" to 5000, "🎪" to 50, "🌈" to 1, "🍾" to 2, "🔔" to 1500, "🐉" to 10000, "🏠" to 200, "🎈" to 50, "🍟" to 10000, "🦁" to 5, "🚁" to 20, "🎂" to 5000, "👑" to 60, "🚒" to 500, "🌅" to 30, "🍰" to 2, "🌠" to 150, "🎮" to 10, "🦋" to 300, "❤️" to 10, "🌋" to 300, "🍕" to 80, "🐶" to 3000, "🎸" to 60, "🍪" to 8, "🚀" to 40, "🚤" to 100, "☕" to 200, "🍀" to 15, "🎨" to 8, "🌉" to 1000, "🚅" to 500, "⛴️" to 30000)
 fun lumisValue(g: String): Int { val k = g.replace("\uFE0F", ""); return VIEWER_GIFTS.firstOrNull { it.first.replace("\uFE0F", "") == k }?.second ?: 0 }
-// host gifts to viewers (0 lumis) and viewer gifts worth 50+ lumis are animated
-fun giftAnimated(g: String): Boolean { val v = lumisValue(g); return v == 0 || v >= 50 }
+// host gifts to viewers (0 lumis) always animate
+// the 50-999 lumis gifts that have the animation (fixed, same for everyone); the other gifts in that range have none
+val MID_ANIMATED = setOf("🚕", "🚅", "☕", "🐘", "🎈", "🎪", "🚤", "💋", "🎧", "🍕")
+fun giftAnimated(g: String): Boolean { val v = lumisValue(g); return v == 0 || v >= 1000 || (v >= 50 && g.replace("\uFE0F", "") in MID_ANIMATED) }
 fun giftValue(g: String) = (lumisValue(g) * 4).coerceAtLeast(1)
 fun isGuest(id: String?) = id?.startsWith("guest-") == true
 fun isHost(id: String?) = id?.startsWith("host-") == true
@@ -600,7 +602,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b79-recfix2"
+const val BUILD_TAG = "b94-giftpanel"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1092,17 +1094,37 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 SideBtn("Support $guestName", side == "R") { side = "R" }
             }
             // guests can watch only: gifts, chat and follow need a login
-            if (Api.auth.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                VIEWER_GIFTS.forEach { (g, gv) ->
-                    FilledTonalButton({
-                        msgs.addCapped("$user sent $g")
-                        fx.add(g, user)
-                        scope.launch {
-                            lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side))
-                            withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
+            if (Api.auth.isNotEmpty()) {
+                var showGifts by remember { mutableStateOf(false) }
+                var sel by remember { mutableStateOf(VIEWER_GIFTS.first().first) }
+                Row(Modifier.padding(horizontal = 12.dp)) {
+                    FilledTonalButton({ showGifts = !showGifts }, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) { Text(if (showGifts) "✕" else "🎁 Gift") }
+                }
+                if (showGifts) Surface(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), shape = RoundedCornerShape(16.dp), color = Color(0xF0101018)) {
+                    Column(Modifier.padding(8.dp)) {
+                        LazyVerticalGrid(GridCells.Fixed(4), Modifier.height(250.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(VIEWER_GIFTS) { item ->
+                                val g = item.first
+                                val gv = item.second
+                                Column(Modifier.fillMaxWidth().background(if (sel == g) Color(0x55FFFFFF) else Color(0x14FFFFFF), RoundedCornerShape(12.dp))
+                                    .clickable { sel = g }.padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(g, fontSize = 28.sp)
+                                    Text("$gv", fontSize = 12.sp, color = Color(0xFFFFD54F))
+                                }
+                            }
                         }
-                    }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp)) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) { Text(g); Text("$gv", fontSize = 11.sp) }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("$sel  ${lumisValue(sel)} lumis", color = Color.White)
+                            Button({
+                                val g = sel
+                                msgs.addCapped("$user sent $g")
+                                fx.add(g, user)
+                                scope.launch {
+                                    lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side))
+                                    withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
+                                }
+                            }) { Text("Send") }
+                        }
                     }
                 }
             }

@@ -98,7 +98,7 @@ const json = (o, status = 200) =>
 
 // ---------- accounts: email + password + emailed code (needs KV namespace bound as DB, and BREVO_KEY + MAIL_FROM) ----------
 // lumis the host earns per gift (emoji without the variation selector)
-const GIFT_LUMIS = { '❤': 1, '👍': 1, '🌹': 2, '☕': 2, '🍫': 3, '🚀': 5, '💍': 10, '👑': 20, '🎂': 30, '🦄': 50, '🚗': 80, '🏰': 100, '🐉': 200, '🛸': 500, '🌌': 1000 };
+const GIFT_LUMIS = { '🎇': 3000, '🐘': 50, '🐱': 40, '🎻': 1000, '🍦': 15, '🧸': 20, '🎠': 15, '💋': 700, '🎡': 30, '🦄': 2000, '🗼': 2000, '🚗': 100, '🎆': 3000, '🌌': 3, '🚕': 150, '🎀': 700, '🎹': 20000, '🍔': 5, '🎧': 80, '🍷': 40, '💍': 200, '🍫': 10, '🦅': 30000, '🍩': 20, '🚢': 2, '🏰': 20000, '🗽': 1500, '🍓': 3, '🌹': 1, '🛸': 8, '🎤': 1000, '📸': 5, '🌷': 100, '🌙': 30, '🌃': 5000, '🎪': 50, '🌈': 1, '🍾': 2, '🔔': 1500, '🐉': 10000, '🏠': 200, '🎈': 50, '🍟': 10000, '🦁': 5, '🚁': 20, '🎂': 5000, '👑': 60, '🚒': 500, '🌅': 30, '🍰': 2, '🌠': 150, '🎮': 10, '🦋': 300, '❤': 10, '🌋': 300, '🍕': 80, '🐶': 3000, '🎸': 60, '🍪': 8, '🚀': 40, '🚤': 100, '☕': 200, '🍀': 15, '🎨': 8, '🌉': 1000, '🚅': 500, '⛴': 30000 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const pbkdf2 = async (password, salt) => {
@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b77', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b93', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
