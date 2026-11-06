@@ -600,7 +600,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b78-recfix"
+const val BUILD_TAG = "b79-recfix2"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"

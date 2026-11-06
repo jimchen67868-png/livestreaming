@@ -145,12 +145,13 @@ class LiveRecorder(
         if (idx < 0) { drainVideo(); return }
         val img = enc.getInputImage(idx)
         if (img == null) { enc.queueInputBuffer(idx, 0, 0, nowUs, 0); return }
-        val i420: VideoFrame.I420Buffer
+        val i420: VideoFrame.I420Buffer?
         if (b0.width != tw || b0.height != th) {
             val sc = b0.cropAndScale(0, 0, b0.width, b0.height, tw, th)
             i420 = sc.toI420()
             sc.release()
         } else i420 = b0.toI420()
+        if (i420 == null) { enc.queueInputBuffer(idx, 0, 0, nowUs, 0); return }
         try {
             val planes = img.planes
             copyPlane(i420.dataY, i420.strideY, tw, th, planes[0])
