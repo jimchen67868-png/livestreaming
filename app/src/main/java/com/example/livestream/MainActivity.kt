@@ -25,6 +25,8 @@ import androidx.compose.foundation.background
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
@@ -202,8 +204,13 @@ fun MutableList<String>.addCapped(s: String) { add(s); while (size > 50) removeA
 // Gifts the host sends to a viewer (viewers send ❤️ 🌹 🚀 to the host).
 val HOST_GIFTS = listOf("🎁", "🍬", "🏆", "💖", "🎉")
 // Lumis the host earns per gift (the server uses the same amounts)
-fun lumisValue(g: String) = when (g.replace("\uFE0F", "")) { "❤" -> 1; "🌹" -> 2; "🚀" -> 5; else -> 0 }
-fun giftValue(g: String) = when (g) { "🌹" -> 5; "🚀" -> 20; else -> 1 }
+// Gifts viewers can send, with the lumis the host earns (the worker has the same table). Only gifts of 50+ lumis get the full-screen animation; all gifts show the sender banner.
+val VIEWER_GIFTS = listOf("❤️" to 1, "👍" to 1, "🌹" to 2, "☕" to 2, "🍫" to 3, "🚀" to 5, "💍" to 10, "👑" to 20, "🎂" to 30,
+    "🦄" to 50, "🚗" to 80, "🏰" to 100, "🐉" to 200, "🛸" to 500, "🌌" to 1000)
+fun lumisValue(g: String): Int { val k = g.replace("\uFE0F", ""); return VIEWER_GIFTS.firstOrNull { it.first.replace("\uFE0F", "") == k }?.second ?: 0 }
+// host gifts to viewers (0 lumis) and viewer gifts worth 50+ lumis are animated
+fun giftAnimated(g: String): Boolean { val v = lumisValue(g); return v == 0 || v >= 50 }
+fun giftValue(g: String) = (lumisValue(g) * 4).coerceAtLeast(1)
 fun isGuest(id: String?) = id?.startsWith("guest-") == true
 fun isHost(id: String?) = id?.startsWith("host-") == true
 fun pkJson(l: Int, r: Int, left: Int, end: Boolean) =
@@ -593,7 +600,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b75-recguest"
+const val BUILD_TAG = "b77-gifts2"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1085,8 +1092,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                 SideBtn("Support $guestName", side == "R") { side = "R" }
             }
             // guests can watch only: gifts, chat and follow need a login
-            if (Api.auth.isNotEmpty()) Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("❤️", "🌹", "🚀").forEach { g ->
+            if (Api.auth.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                VIEWER_GIFTS.forEach { (g, gv) ->
                     FilledTonalButton({
                         msgs.addCapped("$user sent $g")
                         fx.add(g, user)
@@ -1094,7 +1101,9 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                             lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side))
                             withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
                         }
-                    }) { Text(g) }
+                    }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp)) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) { Text(g); Text("$gv", fontSize = 11.sp) }
+                    }
                 }
             }
             ChatOverlay(msgs, onSend = {

@@ -59,8 +59,10 @@ class GiftFx {
     private var n = 0L
     fun add(g: String, from: String) {
         if (g.isBlank()) return
-        events.add(GiftEvent(n++, g, from))
-        while (events.size > 6) events.removeAt(0)
+        if (giftAnimated(g)) {
+            events.add(GiftEvent(n++, g, from))
+            while (events.size > 6) events.removeAt(0)
+        }
         val now = System.currentTimeMillis()
         val key = g.replace("\uFE0F", "")
         val same = banners.lastOrNull { it.from == from && it.g.replace("\uFE0F", "") == key && now - it.ts < 4000 }

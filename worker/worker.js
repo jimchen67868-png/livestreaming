@@ -98,7 +98,7 @@ const json = (o, status = 200) =>
 
 // ---------- accounts: email + password + emailed code (needs KV namespace bound as DB, and BREVO_KEY + MAIL_FROM) ----------
 // lumis the host earns per gift (emoji without the variation selector)
-const GIFT_LUMIS = { '❤': 1, '🌹': 2, '🚀': 5 };
+const GIFT_LUMIS = { '❤': 1, '👍': 1, '🌹': 2, '☕': 2, '🍫': 3, '🚀': 5, '💍': 10, '👑': 20, '🎂': 30, '🦄': 50, '🚗': 80, '🏰': 100, '🐉': 200, '🛸': 500, '🌌': 1000 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const pbkdf2 = async (password, salt) => {
@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b73', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b77', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
