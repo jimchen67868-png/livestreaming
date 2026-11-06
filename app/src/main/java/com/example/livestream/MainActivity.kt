@@ -593,7 +593,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b73-profilecover"
+const val BUILD_TAG = "b75-recguest"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1121,6 +1121,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var renderer by remember { mutableStateOf<TextureViewRenderer?>(null) }
     var roomId by remember { mutableStateOf("") }
     var hostKey by remember { mutableStateOf("") }
+    // local recording of the live (saved on this phone, 10 minutes at most)
+    var recorder by remember { mutableStateOf<LiveRecorder?>(null) }
+    var recSecs by remember { mutableIntStateOf(0) }
     // live cover from the profile page (saved on the account); it replaces the automatic camera picture and cannot be changed during a live
     var coverB64 by remember { mutableStateOf("") }
     LaunchedEffect(Unit) {
@@ -1243,7 +1246,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     viewers = viewerCount(lk)
                     if (isGuest(e.participant.identity?.value)) { endPk(); guestV = null }
                 }
-                is RoomEvent.Disconnected -> { live = false; cam = null; if (!status.startsWith("Ended")) status = "Disconnected"; try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} }
+                is RoomEvent.Disconnected -> { recorder?.stop(); recorder = null; live = false; cam = null; if (!status.startsWith("Ended")) status = "Disconnected"; try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} }
                 else -> {}
             }
         }
@@ -1260,7 +1263,31 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     LaunchedEffect(result) { if (result.isNotEmpty()) { delay(8000); result = "" } }
     LaunchedEffect(notice) { if (notice.isNotEmpty()) { delay(12000); notice = "" } }
 
+    fun stopRec() { val r = recorder; recorder = null; recSecs = 0; r?.stop() }
+    fun startRec() {
+        if (!live || recorder != null) return
+        if (isGuestAccount(user) || Api.auth.isEmpty()) { notice = "Guests can't record. Log in with an account first."; return }
+        val holder = arrayOfNulls<LiveRecorder>(1)
+        val r = LiveRecorder(ctx.applicationContext, kind == "live", 600_000L) { msg ->
+            if (recorder === holder[0]) { recorder = null; recSecs = 0 }
+            notice = msg
+            android.widget.Toast.makeText(ctx.applicationContext, msg, android.widget.Toast.LENGTH_LONG).show()
+        }
+        holder[0] = r
+        r.muted = muted
+        if (r.start()) { recorder = r; recSecs = 0; notice = "⏺ Recording (10 min max). It is saved on this phone." }
+        else notice = "Could not start recording."
+    }
+    LaunchedEffect(recorder) { while (recorder != null) { recSecs = recorder?.elapsedSec() ?: 0; delay(500) } }
+    LaunchedEffect(muted, recorder) { recorder?.muted = muted }
+    DisposableEffect(cam, recorder) {
+        val r = recorder
+        val c = cam
+        if (r != null && c != null && kind == "live") c.addRenderer(r)
+        onDispose { if (r != null && c != null && kind == "live") try { c.removeRenderer(r) } catch (e: Exception) {} }
+    }
     fun stop() {
+        stopRec()
         lk.disconnect(); live = false; cam = null; sharing = false; status = "Ended"
         try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
     }
@@ -1291,7 +1318,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         }
     }
 
-    DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release(); try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} } }
+    DisposableEffect(Unit) { onDispose { recorder?.stop(); lk.disconnect(); lk.release(); try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} } }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner, live, held) {
         val obs = LifecycleEventObserver { _, ev ->
@@ -1397,7 +1424,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp)
             .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("$status${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers${if (lumis > 0) " • 💎 $lumis" else ""}", color = Color.White,
+            Text("$status${if (recorder != null) " • ⏺ %d:%02d".format(recSecs / 60, recSecs % 60) else ""}${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers${if (lumis > 0) " • 💎 $lumis" else ""}", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
                     .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
             if (pkActive) PkBoard(scoreL, scoreR, pkLeft, user, guestName, Modifier.fillMaxWidth())
@@ -1499,6 +1526,8 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 }, enabled = live && !pkActive && held == null) { Text(if (sharing) "Unshare" else "Share") }
                 if (kind == "audio") OutlinedButton({ showYt = true }, enabled = live && !sharing) { Text("YouTube") }
                 if (kind == "live") OutlinedButton({ cam?.switchCamera() }, enabled = live) { Text("Flip") }
+                OutlinedButton({ if (recorder != null) stopRec() else startRec() }, enabled = live && held == null && !isGuestAccount(user),
+                    contentPadding = PaddingValues(horizontal = 12.dp)) { Text(if (recorder != null) "⏹" else "⏺") }
                 OutlinedButton({
                     if (FloatChat.canShow(ctx)) android.widget.Toast.makeText(ctx, "Floating chat is on: it shows when you leave the app", android.widget.Toast.LENGTH_LONG).show()
                     else FloatChat.askPermission(ctx)
