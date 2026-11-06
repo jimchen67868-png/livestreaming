@@ -624,7 +624,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b101-alerttap"
+const val BUILD_TAG = "b102-countdown"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1445,6 +1445,25 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         lk.disconnect(); live = false; cam = null; sharing = false; status = "Ended"
         try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {}
     }
+    // camera preview before going live; "Go Live" then counts 3 2 1 and starts the live
+    var preview by remember { mutableStateOf<LocalVideoTrack?>(null) }
+    var countdown by remember { mutableIntStateOf(0) }
+    fun stopPreview() {
+        val t = preview
+        preview = null
+        try { t?.stop() } catch (e: Exception) {}
+    }
+    LaunchedEffect(kind, live) {
+        if (kind == "live" && !live) {
+            if (preview == null) {
+                try {
+                    val t = lk.localParticipant.createVideoTrack()
+                    t.startCapture()
+                    preview = t
+                } catch (e: Exception) { notice = "Camera preview failed: ${e.message}" }
+            }
+        } else if (preview != null) stopPreview()
+    }
     fun start() {
         scope.launch {
             try {
@@ -1461,6 +1480,16 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             } catch (e: Exception) { status = "Error: ${e.message}" }
         }
     }
+    fun goLive() {
+        if (kind != "live") { start(); return }
+        scope.launch {
+            for (i in 3 downTo 1) { countdown = i; delay(1000) }
+            countdown = 0
+            stopPreview()
+            delay(350) // let the camera be released before the live takes it
+            start()
+        }
+    }
     fun accept(inv: Pair<String, String>) {
         invite = null
         scope.launch {
@@ -1472,7 +1501,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         }
     }
 
-    DisposableEffect(Unit) { onDispose { recorder?.stop(); lk.disconnect(); lk.release(); try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} } }
+    DisposableEffect(Unit) { onDispose { try { preview?.stop() } catch (e: Exception) {}; recorder?.stop(); lk.disconnect(); lk.release(); try { ctx.stopService(Intent(ctx, LiveService::class.java)) } catch (e: Exception) {} } }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner, live, held) {
         val obs = LifecycleEventObserver { _, ev ->
@@ -1569,12 +1598,13 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 }
             } else Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
                 val fr = ratioValue(ratio)
-                VideoView(lk, cam, if (fr != null) Modifier.aspectRatio(fr) else Modifier.fillMaxSize(),
+                VideoView(lk, cam ?: preview, if (fr != null) Modifier.aspectRatio(fr) else Modifier.fillMaxSize(),
                     onReady = { renderer = it }, scaleFill = if (fr != null) true else null)
             }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
         GiftOverlay(fx)
+        if (countdown > 0) Text("$countdown", color = Color.White, fontSize = 140.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Center))
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp)
             .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1660,7 +1690,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
             Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button({ if (live) stop() else start() }, Modifier.weight(1f)) { Text(if (live) "End" else "Go Live") }
+                Button({ if (live) stop() else goLive() }, Modifier.weight(1f), enabled = live || countdown == 0) { Text(if (live) "End" else if (countdown > 0) "Starting…" else "Go Live") }
                 OutlinedButton({
                     scope.launch {
                         try { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
