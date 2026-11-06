@@ -75,6 +75,45 @@ object Api {
 
     data class Post(val id: String, val user: String, val kind: String, val caption: String, val ts: Long)
 
+    data class ProfileInfo(val followers: Int, val following: Int, val received: Long, val spent: Long, val posts: List<Post>)
+
+    /** Follower / following numbers and latest posts of an account, or null if the server can't be reached. */
+    fun profile(server: String, name: String): ProfileInfo? = try {
+        val url = "${base(server)}/profile?u=" + java.net.URLEncoder.encode(name, "UTF-8")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            if (!r.isSuccessful) null else {
+                val o = JSONObject(r.body!!.string())
+                val a = o.optJSONArray("posts") ?: JSONArray()
+                ProfileInfo(o.optInt("followers"), o.optInt("following"), o.optLong("received"), o.optLong("spent"), (0 until a.length()).map {
+                    val p = a.getJSONObject(it)
+                    Post(p.getString("id"), name, p.optString("kind", "photo"), p.optString("caption"), p.optLong("ts"))
+                })
+            }
+        }
+    } catch (e: Exception) { null }
+
+    /** Tells the server about a follow / unfollow (fire and forget; the phone's own list still works without it). */
+    fun followAsync(server: String, to: String, on: Boolean) {
+        if (auth.isEmpty() || server.isBlank()) return
+        Thread {
+            try {
+                val body = JSONObject().put("to", to).put("on", on).toString().toRequestBody("application/json".toMediaType())
+                http.newCall(Request.Builder().url("${base(server)}/follow").header("X-Auth", auth).post(body).build()).execute().close()
+            } catch (e: Exception) {}
+        }.start()
+    }
+
+    @Volatile var followsSynced = false
+
+    /** Uploads the follows saved on this phone to the account once per app start. */
+    fun syncFollows(server: String, names: List<String>) {
+        if (auth.isEmpty() || followsSynced || server.isBlank()) return
+        try {
+            val body = JSONObject().put("names", JSONArray(names)).toString().toRequestBody("application/json".toMediaType())
+            http.newCall(Request.Builder().url("${base(server)}/followsync").header("X-Auth", auth).post(body).build()).execute().use { followsSynced = it.isSuccessful }
+        } catch (e: Exception) {}
+    }
+
     // uploads of videos can take a while
     private val httpLong = http.newBuilder()
         .callTimeout(180, java.util.concurrent.TimeUnit.SECONDS)

@@ -27,9 +27,13 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -49,6 +53,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
@@ -137,9 +142,18 @@ class MainActivity : ComponentActivity() {
         }
         note("create", now() + " restored=" + (savedInstanceState != null))
         LocalGuard.load(applicationContext)
+        LiveAlerts.schedule(applicationContext)
         GenderGuard.load(applicationContext)
         AppTheme.load(getSharedPreferences("s", 0))
+        OpenRoom.fromIntent(intent)
         setContent { MaterialTheme(colorScheme = AppTheme.scheme()) { Surface(Modifier.fillMaxSize()) { App() } } }
+    }
+
+    // the app is already open and a notification is tapped
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        OpenRoom.fromIntent(intent)
     }
 }
 
@@ -161,6 +175,14 @@ fun App() {
     var user by remember { mutableStateOf(sp.getString("acct", "")?.takeIf { it.isNotEmpty() } ?: makeGuestName(sp)) }
     remember { Api.auth = sp.getString("auth", "") ?: ""; true }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+    // a tapped "is live" notification: go straight into that live (not while you are broadcasting)
+    val wanted = OpenRoom.pending.value
+    LaunchedEffect(wanted) {
+        if (wanted != null) {
+            if (screen !is Screen.Live && screen !is Screen.Guest) screen = Screen.Watch(wanted)
+            OpenRoom.pending.value = null
+        }
+    }
     // dark icons in the status bar on the light Home screen; video screens stay dark
     val act = ctx as? android.app.Activity
     SideEffect {
@@ -200,7 +222,7 @@ fun chatLine(name: String, o: JSONObject, broadcaster: Boolean = false): String?
 }
 
 fun parseJson(b: ByteArray): JSONObject? = try { JSONObject(String(b)) } catch (e: Exception) { null }
-fun MutableList<String>.addCapped(s: String) { add(s); while (size > 50) removeAt(0) }
+fun MutableList<String>.addCapped(s: String) { add(s); while (size > 200) removeAt(0) }
 // Gifts the host sends to a viewer (viewers send ❤️ 🌹 🚀 to the host).
 val HOST_GIFTS = listOf("🎁", "🍬", "🏆", "💖", "🎉")
 // Lumis the host earns per gift (the server uses the same amounts)
@@ -602,7 +624,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b94-giftpanel"
+const val BUILD_TAG = "b101-alerttap"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -675,6 +697,8 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
     val fctx = LocalContext.current
     var tick by remember { mutableStateOf(0) }
     var giftFor by remember { mutableStateOf("") }
+    var profileFor by remember { mutableStateOf("") }
+    if (profileFor.isNotEmpty()) ProfileDialog(profileFor.removeSuffix(" (you)").removeSuffix(" (host)"), profileFor.endsWith(" (host)"), profileFor.endsWith(" (you)")) { profileFor = "" }
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
@@ -687,9 +711,12 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
                     val clean = n.removeSuffix(" (you)").removeSuffix(" (host)")
                     val isHostRow = n.endsWith(" (host)")
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(clean, 30.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(if (isHostRow) "\uD83D\uDC51 $n" else n, Modifier.weight(1f))
+                        // tap a name to see that person's profile
+                        Row(Modifier.weight(1f).clickable { profileFor = n }.padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Avatar(clean, 30.dp)
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (isHostRow) "\uD83D\uDC51 $n" else n)
+                        }
                         // the host can send a gift to a viewer (a different set from the gifts viewers send to the host)
                         if (onGift != null && !n.endsWith("(you)") && !isHostRow) {
                             TextButton({ giftFor = if (giftFor == n) "" else n }) { Text("\uD83C\uDF81") }
@@ -708,6 +735,83 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
             }
         }
     )
+}
+
+@Composable
+fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> Unit) {
+    val fctx = LocalContext.current
+    var tick by remember { mutableStateOf(0) }
+    val guest = isGuestAccount(name)
+    val cover by produceState<ImageBitmap?>(null, name) {
+        value = if (guest) null else withContext(Dispatchers.IO) {
+            Api.fetchBytes(Api.serverUrl, "cover?u=" + java.net.URLEncoder.encode(name, "UTF-8"))?.let {
+                BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap()
+            }
+        }
+    }
+    // numbers + posts from the server (first uploads the follows that were only on this phone)
+    val info by produceState<Api.ProfileInfo?>(null, name) {
+        value = if (guest) null else withContext(Dispatchers.IO) {
+            Api.syncFollows(Api.serverUrl, Follows.list(fctx))
+            Api.profile(Api.serverUrl, name)
+        }
+    }
+    val following0 = remember(name) { Follows.has(fctx, name) } // state when the dialog opened (the server count already includes it)
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClose) { Text("Close") } },
+        text = {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Avatar(name, 96.dp)
+                Text(if (isHost) "\uD83D\uDC51 $name" else name, style = MaterialTheme.typography.titleLarge)
+                Text(when { isHost -> "Broadcaster"; guest -> "Guest (no profile)"; isMe -> "This is you"; else -> "Member" }, style = MaterialTheme.typography.bodySmall)
+                if (!guest) {
+                    val nowFollowing = tick >= 0 && Follows.has(fctx, name)
+                    val adj = (if (nowFollowing) 1 else 0) - (if (following0) 1 else 0)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                        StatBox("Received", info?.received?.toString() ?: "-")
+                        StatBox("Spent", info?.spent?.toString() ?: "-")
+                        StatBox("Followers", info?.let { (it.followers + adj).coerceAtLeast(0).toString() } ?: "-")
+                        StatBox("Following", info?.following?.toString() ?: "-")
+                    }
+                }
+                cover?.let { Image(it, null, Modifier.size(140.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop) }
+                if (Api.auth.isNotEmpty() && !isMe && !guest) {
+                    Button({ Follows.toggle(fctx, name); tick++ }) {
+                        Text(if (tick >= 0 && Follows.has(fctx, name)) "Following \u2713" else "+ Follow")
+                    }
+                }
+                val posts = info?.posts.orEmpty()
+                if (!guest) {
+                    Text(if (info == null) "Loading..." else if (posts.isEmpty()) "No posts yet" else "Posts", style = MaterialTheme.typography.titleSmall)
+                    posts.chunked(3).forEach { rowPosts ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            rowPosts.forEach { p ->
+                                val th by produceState<ImageBitmap?>(null, p.id) {
+                                    value = withContext(Dispatchers.IO) {
+                                        Api.fetchBytes(Api.serverUrl, "post/" + p.id + "/thumb")?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+                                    }
+                                }
+                                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp)).background(Color(0x22888888))) {
+                                    th?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+                                    if (p.kind == "video") Text("\u25B6", color = Color.White, modifier = Modifier.align(Alignment.Center))
+                                }
+                            }
+                            repeat(3 - rowPosts.size) { Spacer(Modifier.weight(1f)) }
+                        }
+                    }
+                }
+            }
+        }
+    )
+}
+
+@Composable
+fun StatBox(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text(label, style = MaterialTheme.typography.bodySmall)
+    }
 }
 
 @Composable
@@ -734,14 +838,24 @@ fun SideBtn(text: String, selected: Boolean, onClick: () -> Unit) {
 fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
     Column(modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        msgs.takeLast(6).forEach {
-            // lines from the host are gold and bold. Only the part before the first ":" is checked, so a viewer cannot fake it in a message.
-            val fromBroadcaster = it.substringBefore(":").contains("(broadcaster)")
-            Text(it, color = if (fromBroadcaster) Color(0xFFFFD54F) else Color.White,
-                fontWeight = if (fromBroadcaster) androidx.compose.ui.text.font.FontWeight.Bold else null,
-                modifier = Modifier
-                    .background(Color(0x66000000), RoundedCornerShape(8.dp))
-                    .padding(horizontal = 8.dp, vertical = 2.dp))
+        // scrollable: swipe up to read older messages; it follows new messages unless you scrolled up
+        val listState = rememberLazyListState()
+        val atBottom by remember { derivedStateOf {
+            val li = listState.layoutInfo
+            li.totalItemsCount == 0 || (li.visibleItemsInfo.lastOrNull()?.index ?: 0) >= li.totalItemsCount - 2
+        } }
+        LaunchedEffect(msgs.size, msgs.lastOrNull()) { if (atBottom && msgs.isNotEmpty()) listState.scrollToItem(msgs.size - 1) }
+        LazyColumn(Modifier.heightIn(max = 190.dp), state = listState, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(count = msgs.size) { i ->
+                val it = msgs[i]
+                // lines from the host are gold and bold. Only the part before the first ":" is checked, so a viewer cannot fake it in a message.
+                val fromBroadcaster = it.substringBefore(":").contains("(broadcaster)")
+                Text(it, color = if (fromBroadcaster) Color(0xFFFFD54F) else Color.White,
+                    fontWeight = if (fromBroadcaster) androidx.compose.ui.text.font.FontWeight.Bold else null,
+                    modifier = Modifier
+                        .background(Color(0x66000000), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp))
+            }
         }
         if (Api.auth.isEmpty()) {
             Text("Log in (👤 on Home) to chat", color = Color.White, modifier = Modifier
@@ -871,9 +985,18 @@ fun HomeScreen(
             delay(8000)
         }
     }
+    val alertCtx = LocalContext.current
+    var alertsOn by remember { mutableStateOf(LiveAlerts.enabled(alertCtx)) }
+    val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            // alert when someone you follow goes live (checked about every 15 minutes in the background)
+            TextButton({
+                alertsOn = !alertsOn
+                LiveAlerts.setEnabled(alertCtx, alertsOn)
+                if (alertsOn && !notifAllowed(alertCtx) && android.os.Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }) { Text(if (alertsOn) "🔔" else "🔕") }
             TextButton({ showTheme = true }) { Text("🎨") }
             TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct" + (if (lumis >= 0) " 💎$lumis" else "")) }
             TextButton({ showDiag = true }) { Text("ⓘ") }

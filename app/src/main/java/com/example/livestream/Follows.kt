@@ -10,6 +10,8 @@ object Follows {
         (ctx.getSharedPreferences("s", 0).getString("follows", "") ?: "")
             .split("\n").filter { it.isNotBlank() }.toSet()
 
+    fun list(ctx: Context): List<String> = all(ctx).toList()
+
     fun has(ctx: Context, name: String): Boolean = key(name) in all(ctx)
 
     // returns true if the person is now followed
@@ -19,6 +21,7 @@ object Follows {
         val s = all(ctx).toMutableSet()
         val now = if (k in s) { s.remove(k); false } else { s.add(k); true }
         ctx.getSharedPreferences("s", 0).edit().putString("follows", s.joinToString("\n")).apply()
+        if (!isGuestAccount(k)) Api.followAsync(Api.serverUrl, k, now)
         return now
     }
 }

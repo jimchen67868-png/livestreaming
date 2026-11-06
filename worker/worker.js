@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b93', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b99', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -248,6 +248,8 @@ export default {
         const lk = 'l:' + host.toLowerCase();
         const total = (parseInt(await env.DB.get(lk), 10) || 0) + val;
         await env.DB.put(lk, String(total));
+        const sk = 'sp:' + viewer.toLowerCase(); // total lumis this account has spent on gifts
+        await env.DB.put(sk, String((parseInt(await env.DB.get(sk), 10) || 0) + val));
         return json({ ok: true, lumis: val });
       }
       if (req.method === 'GET' && u.pathname === '/wallet') {
@@ -372,6 +374,64 @@ export default {
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         return new Response(bytes, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache' } });
+      }
+      // ---------- follow graph kept on the server, so a profile can show follower / following counts ----------
+      // KV: fg:<name> = JSON list of the names this account follows, fn:<name> = how many follow this account
+      if (req.method === 'POST' && u.pathname === '/follow') {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const me = await userOf(req, env);
+        if (!me) return json({ error: 'Log in' }, 401);
+        const b = await req.json();
+        const to = String(b.to || '').toLowerCase().slice(0, 20);
+        const mk = me.toLowerCase();
+        if (!to || to === mk) return json({ error: 'bad name' }, 400);
+        const list = (await env.DB.get('fg:' + mk, 'json')) || [];
+        const has = list.includes(to);
+        if (b.on && !has) {
+          if (!(await env.DB.get('u:' + to))) return json({ error: 'No such account' }, 404);
+          if (list.length >= 500) return json({ error: 'You can follow up to 500 people' }, 400);
+          list.push(to);
+          await env.DB.put('fg:' + mk, JSON.stringify(list));
+          await env.DB.put('fn:' + to, String((parseInt(await env.DB.get('fn:' + to), 10) || 0) + 1));
+        } else if (!b.on && has) {
+          await env.DB.put('fg:' + mk, JSON.stringify(list.filter((x) => x !== to)));
+          await env.DB.put('fn:' + to, String(Math.max(0, (parseInt(await env.DB.get('fn:' + to), 10) || 0) - 1)));
+        }
+        return json({ ok: true });
+      }
+      // one-time upload of the follows that were saved only on the phone
+      if (req.method === 'POST' && u.pathname === '/followsync') {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const me = await userOf(req, env);
+        if (!me) return json({ error: 'Log in' }, 401);
+        const b = await req.json();
+        const mk = me.toLowerCase();
+        const list = (await env.DB.get('fg:' + mk, 'json')) || [];
+        let added = 0;
+        for (const raw of (Array.isArray(b.names) ? b.names : []).slice(0, 100)) {
+          const to = String(raw || '').toLowerCase().slice(0, 20);
+          if (!to || to === mk || list.includes(to) || list.length >= 500) continue;
+          if (!(await env.DB.get('u:' + to))) continue;
+          list.push(to);
+          added++;
+          await env.DB.put('fn:' + to, String((parseInt(await env.DB.get('fn:' + to), 10) || 0) + 1));
+        }
+        if (added) await env.DB.put('fg:' + mk, JSON.stringify(list));
+        return json({ ok: true, added });
+      }
+      // public profile numbers + that person's latest posts
+      if (req.method === 'GET' && u.pathname === '/profile') {
+        if (!env.DB) return json({ followers: 0, following: 0, spent: 0, received: 0, postCount: 0, posts: [] });
+        const nm = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20);
+        if (!nm) return json({ error: 'name?' }, 400);
+        const followers = parseInt(await env.DB.get('fn:' + nm), 10) || 0;
+        const following = ((await env.DB.get('fg:' + nm, 'json')) || []).length;
+        const spent = parseInt(await env.DB.get('sp:' + nm), 10) || 0;
+        const received = parseInt(await env.DB.get('l:' + nm), 10) || 0; // lumis earned as a host
+        const l = await env.DB.list({ prefix: 'pm:', limit: 1000 }); // newest first
+        const mine = l.keys.filter((k) => String((k.metadata || {}).u || '').toLowerCase() === nm);
+        return json({ followers, following, spent, received, postCount: mine.length, posts: mine.slice(0, 12).map((k) => ({
+          id: k.name.slice(3), kind: (k.metadata || {}).k || 'photo', caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0 })) });
       }
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);
