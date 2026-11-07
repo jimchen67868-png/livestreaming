@@ -43,7 +43,7 @@ import org.json.JSONObject
 // current = account name when logged in, "" for guest.
 // onDone(token, name): a new session, or ("", "") after logging out.
 @Composable
-fun AccountDialog(server: String, current: String, onDone: (String, String) -> Unit, onClose: () -> Unit) {
+fun AccountDialog(server: String, current: String, onDone: (String, String) -> Unit, onPosts: () -> Unit, onClose: () -> Unit) {
     val ctx = LocalContext.current
     val sp = ctx.getSharedPreferences("s", 0)
     // an email that is waiting for its code is remembered, so closing the app does not lose it
@@ -115,6 +115,7 @@ fun AccountDialog(server: String, current: String, onDone: (String, String) -> U
                 if (current.isNotEmpty()) {
                     Avatar(current, 80.dp)
                     Text("You are logged in as $current. This name is yours alone.")
+                    Button(onPosts, Modifier.fillMaxWidth()) { Text("📷 My posts: add photo or video") }
                     OutlinedButton({ pickPhoto.launch("image/*") }, enabled = !busy) { Text("Change profile photo") }
                     Text("Live cover (shown on Home when you go live, and used for every live)", style = MaterialTheme.typography.bodySmall)
                     val cover by produceState<ImageBitmap?>(null, current, coverRev) {

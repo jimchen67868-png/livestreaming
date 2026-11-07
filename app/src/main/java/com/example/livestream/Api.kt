@@ -73,7 +73,7 @@ object Api {
         }
     } catch (e: Exception) { "Can't reach server" }
 
-    data class Post(val id: String, val user: String, val kind: String, val caption: String, val ts: Long)
+    data class Post(val id: String, val user: String, val kind: String, val caption: String, val ts: Long, val cleared: Boolean = false)
 
     data class ProfileInfo(val followers: Int, val following: Int, val received: Long, val spent: Long, val posts: List<Post>)
 
@@ -86,7 +86,7 @@ object Api {
                 val a = o.optJSONArray("posts") ?: JSONArray()
                 ProfileInfo(o.optInt("followers"), o.optInt("following"), o.optLong("received"), o.optLong("spent"), (0 until a.length()).map {
                     val p = a.getJSONObject(it)
-                    Post(p.getString("id"), name, p.optString("kind", "photo"), p.optString("caption"), p.optLong("ts"))
+                    Post(p.getString("id"), name, p.optString("kind", "photo"), p.optString("caption"), p.optLong("ts"), p.optBoolean("v"))
                 })
             }
         }
@@ -126,14 +126,14 @@ object Api {
             val a = JSONArray(r.body!!.string())
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                Post(o.getString("id"), o.optString("user"), o.optString("kind", "photo"), o.optString("caption"), o.optLong("ts"))
+                Post(o.getString("id"), o.optString("user"), o.optString("kind", "photo"), o.optString("caption"), o.optLong("ts"), o.optBoolean("v"))
             }
         }
     } catch (e: Exception) { emptyList() }
 
     /** Step 1 of posting: details and a small preview. Returns the new post id or throws with the server's message. */
-    fun createPost(server: String, kind: String, caption: String, thumbB64: String): String {
-        val body = JSONObject().put("kind", kind).put("caption", caption).put("thumb", thumbB64).toString()
+    fun createPost(server: String, kind: String, caption: String, thumbB64: String, frames: List<String> = emptyList()): String {
+        val body = JSONObject().put("kind", kind).put("caption", caption).put("thumb", thumbB64).put("frames", JSONArray(frames)).toString()
             .toRequestBody("application/json".toMediaType())
         return http.newCall(Request.Builder().url("${base(server)}/posts").header("X-Auth", auth).post(body).build()).execute().use { r ->
             val o = JSONObject(r.body!!.string())
@@ -150,6 +150,22 @@ object Api {
             if (o.optBoolean("ok")) "" else o.optString("error", "Upload failed (" + r.code + ")")
         }
     } catch (e: Exception) { "Upload failed: " + (e.message ?: "no connection") }
+
+    /** Poster's phone flagged a picture: asks the server for a second opinion. true = the server agrees (or is unavailable), so refuse. */
+    fun confirmNudity(server: String, imgB64: String): Boolean = try {
+        val body = JSONObject().put("img", imgB64).toString().toRequestBody("application/json".toMediaType())
+        httpLong.newCall(Request.Builder().url("${base(server)}/posts/check").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            JSONObject(r.body!!.string()).optBoolean("confirmed", true)
+        }
+    } catch (e: Exception) { true }
+
+    /** Viewer's phone flagged a post: server second opinion. "removed" = confirmed and deleted, otherwise "ok". */
+    fun confirmPost(server: String, id: String, imgB64: String): String = try {
+        val body = JSONObject().put("img", imgB64).toString().toRequestBody("application/json".toMediaType())
+        httpLong.newCall(Request.Builder().url("${base(server)}/post/$id/check").post(body).build()).execute().use { r ->
+            if (JSONObject(r.body!!.string()).optBoolean("removed")) "removed" else "ok"
+        }
+    } catch (e: Exception) { "ok" }
 
     fun deletePost(server: String, id: String): Boolean = try {
         http.newCall(Request.Builder().url("${base(server)}/post/$id").header("X-Auth", auth).delete().build()).execute().use { it.isSuccessful }

@@ -225,7 +225,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b99', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b111', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -283,20 +283,61 @@ export default {
         const who = await userOf(req, env);
         if (!who) return json({ error: 'Log in to post' }, 401);
         const b = await req.json();
-        const kind = b.kind === 'video' ? 'video' : 'photo';
+        const kind = b.kind === 'video' ? 'video' : (b.kind === 'text' ? 'text' : 'photo'); // text posts have no picture
         const thumb = String(b.thumb || '');
-        if (thumb.length < 100 || thumb.length > 40000 || !/^[A-Za-z0-9+/=]+$/.test(thumb)) return json({ error: 'bad preview picture' }, 400);
+        if (kind === 'text' && !String(b.caption || '').trim()) return json({ error: 'Write something first' }, 400);
+        if (kind !== 'text' && (thumb.length < 100 || thumb.length > 40000 || !/^[A-Za-z0-9+/=]+$/.test(thumb))) return json({ error: 'bad preview picture' }, 400);
         const ck = 'pc:' + who.toLowerCase(); // at most 10 posts per day
         const c = (await env.DB.get(ck, 'json')) || { n: 0, exp: Date.now() + 86400000 };
         if (c.n >= 10) return json({ error: 'You can post 10 times per day' }, 429);
-        const sc = await nudityScore(env, thumb);
-        if (sc !== null && sc >= 0.6) return json({ error: 'This picture was refused' }, 400);
         c.n++;
         await env.DB.put(ck, JSON.stringify(c), { expirationTtl: Math.max(60, Math.ceil((c.exp - Date.now()) / 1000)) });
         const id = String(9999999999999 - Date.now()).padStart(13, '0') + Math.random().toString(36).slice(2, 6);
+        if (kind === 'text') { // saved right away, there is no file to upload afterwards
+          const text = String(b.caption || '').trim().slice(0, 500);
+          await env.DB.put('pd:' + id, text, { metadata: { k: 'text' } });
+          await env.DB.put('pm:' + id, '', { metadata: { u: who, k: 'text', c: text.slice(0, 100), t: Date.now() } });
+          return json({ id });
+        }
         await env.DB.put('pt:' + id, thumb);
         await env.DB.put('pp:' + id, JSON.stringify({ user: who, kind, caption: String(b.caption || '').slice(0, 100) }), { expirationTtl: 3600 });
         return json({ id });
+      }
+      // second opinion for the poster's phone: it only asks when its own check flagged a picture
+      if (req.method === 'POST' && u.pathname === '/posts/check') {
+        const who = await userOf(req, env);
+        if (!who) return json({ error: 'Log in to post' }, 401);
+        const b = await req.json();
+        const img = String(b.img || '');
+        if (img.length > 80000 || !/^[A-Za-z0-9+/=]+$/.test(img)) return json({ confirmed: true });
+        const sc = await nudityScore(env, img);
+        return json({ confirmed: sc === null ? true : sc >= 0.6, unavailable: sc === null });
+      }
+      // second opinion for a viewer's phone: it only asks when its own check flagged the post. Confirmed = the post is removed for everyone.
+      const pck = u.pathname.match(/^\/post\/(\w+)\/check$/);
+      if (req.method === 'POST' && pck) {
+        if (!env.DB) return json({ removed: false });
+        const pmeta = await env.DB.getWithMetadata('pm:' + pck[1]);
+        if (!pmeta.metadata) return json({ removed: false, gone: true });
+        if (pmeta.metadata.v) return json({ removed: false, cleared: true }); // the server already looked at this post: not checked again
+        const ip = req.headers.get('CF-Connecting-IP') || 'x';
+        const rk = 'pv:' + ip;
+        const cnt = parseInt(await env.DB.get(rk), 10) || 0;
+        if (cnt >= 60) return json({ removed: false });
+        await env.DB.put(rk, String(cnt + 1), { expirationTtl: 86400 });
+        const id = pck[1];
+        const b = await req.json();
+        const img = String(b.img || '');
+        if (img.length > 80000 || !/^[A-Za-z0-9+/=]+$/.test(img)) return json({ removed: false });
+        const sc = await nudityScore(env, img);
+        if (sc !== null && sc >= 0.6) {
+          await env.DB.delete('pd:' + id);
+          await env.DB.delete('pt:' + id);
+          await env.DB.delete('pm:' + id);
+          return json({ removed: true });
+        }
+        if (sc !== null) await env.DB.put('pm:' + id, '', { metadata: { ...pmeta.metadata, v: 1 } }); // server looked and it is fine: remember
+        return json({ removed: false });
       }
       const pdm = u.pathname.match(/^\/post\/(\w+)\/data$/);
       if (req.method === 'PUT' && pdm) { // step 2: the photo or video itself
@@ -321,7 +362,7 @@ export default {
         if (!env.DB) return json([]);
         const l = await env.DB.list({ prefix: 'pm:', limit: 60 }); // newest first (ids count down)
         return json(l.keys.map((k) => ({ id: k.name.slice(3), user: (k.metadata || {}).u || '', kind: (k.metadata || {}).k || 'photo',
-          caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0 })));
+          caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0, v: !!(k.metadata || {}).v })));
       }
       const pgm = u.pathname.match(/^\/post\/(\w+)(\/thumb)?$/);
       if (req.method === 'GET' && pgm) {
@@ -337,7 +378,7 @@ export default {
         }
         const d = await env.DB.getWithMetadata('pd:' + pgm[1], 'arrayBuffer');
         if (!d.value) return new Response('', { status: 404 });
-        return new Response(d.value, { headers: { 'Content-Type': (d.metadata || {}).k === 'video' ? 'video/mp4' : 'image/jpeg', ...cache } });
+        return new Response(d.value, { headers: { 'Content-Type': (d.metadata || {}).k === 'video' ? 'video/mp4' : ((d.metadata || {}).k === 'text' ? 'text/plain; charset=utf-8' : 'image/jpeg'), ...cache } });
       }
       if (req.method === 'DELETE' && pgm && !pgm[2]) {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -431,7 +472,7 @@ export default {
         const l = await env.DB.list({ prefix: 'pm:', limit: 1000 }); // newest first
         const mine = l.keys.filter((k) => String((k.metadata || {}).u || '').toLowerCase() === nm);
         return json({ followers, following, spent, received, postCount: mine.length, posts: mine.slice(0, 12).map((k) => ({
-          id: k.name.slice(3), kind: (k.metadata || {}).k || 'photo', caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0 })) });
+          id: k.name.slice(3), kind: (k.metadata || {}).k || 'photo', caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0, v: !!(k.metadata || {}).v })) });
       }
       if (req.method === 'GET' && u.pathname === '/me') {
         const a = await userOf(req, env);

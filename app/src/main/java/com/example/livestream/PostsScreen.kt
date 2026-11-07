@@ -21,6 +21,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -48,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -66,7 +70,7 @@ const val MAX_VIDEO_MS = 8000L          // videos may be 8 seconds at most
 const val MAX_VIDEO_BYTES = 12_000_000L // and 12 MB
 const val MAX_PHOTO_BYTES = 550_000
 
-class PostPrep(val kind: String, val file: File, val thumb: String)
+class PostPrep(val kind: String, val file: File, val thumb: String, val frames: List<String> = emptyList())
 
 // Downloads pictures from the server; small previews are kept in memory.
 object Remote {
@@ -95,6 +99,52 @@ private fun squareThumbOf(b: Bitmap): String {
     return s
 }
 
+// a larger picture (480 px) for the server's second opinion
+private fun checkB64(b: Bitmap): String {
+    val m = maxOf(b.width, b.height)
+    val f = if (m > 480) 480f / m else 1f
+    val sc = if (f < 1f) Bitmap.createScaledBitmap(b, (b.width * f).toInt().coerceAtLeast(1), (b.height * f).toInt().coerceAtLeast(1), true) else b
+    var q = 70
+    var s = jpegB64(sc, q)
+    while (s.length > 60000 && q > 20) { q -= 10; s = jpegB64(sc, q) }
+    return s
+}
+
+// posts this phone has already checked and found fine (not checked again when opened later)
+object PostChecked {
+    private const val KEY = "post_checked"
+    fun has(ctx: Context, id: String): Boolean = ctx.getSharedPreferences("s", 0).getStringSet(KEY, emptySet())?.contains(id) == true
+    fun add(ctx: Context, id: String) {
+        val sp = ctx.getSharedPreferences("s", 0)
+        val set = LinkedHashSet(sp.getStringSet(KEY, emptySet()) ?: emptySet())
+        set.add(id)
+        while (set.size > 500) set.remove(set.first()) // keep the newest 500
+        sp.edit().putStringSet(KEY, set).apply()
+    }
+}
+
+// Viewer side: the phone looks first; only a flagged picture goes to the server for a second opinion. "ok" or "removed".
+private fun screenBitmap(server: String, id: String, bmp: Bitmap): String =
+    if (!LocalGuard.suspicious(bmp)) "ok" else Api.confirmPost(server, id, checkB64(bmp))
+
+private fun screenVideo(server: String, id: String, path: String): String {
+    val r = MediaMetadataRetriever()
+    try {
+        r.setDataSource(path)
+        val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        var t = 0L
+        while (t < dur.coerceAtMost(9000L)) {
+            val f = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            if (f != null && LocalGuard.suspicious(f)) return Api.confirmPost(server, id, checkB64(f))
+            t += 1000L
+        }
+    } catch (e: Exception) {
+    } finally {
+        try { r.release() } catch (e: Exception) {}
+    }
+    return "ok"
+}
+
 // Photo: turned upright, scaled to 1280 px, checked on the phone, saved as a small JPEG in `out`.
 private fun preparePhoto(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, String> {
     try {
@@ -117,6 +167,7 @@ private fun preparePhoto(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, Str
             val f = 1280f / m
             bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * f).toInt(), (bmp.height * f).toInt(), true)
         }
+        // uploading: only the phone checks
         if (LocalGuard.suspicious(bmp)) return Pair(null, "This picture looks inappropriate and cannot be posted")
         var q = 85
         var bytes = ByteArray(0)
@@ -162,14 +213,19 @@ private fun prepareVideo(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, Str
             val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
             if (dur <= 0L) return Pair(null, "Could not read the video")
             if (dur > MAX_VIDEO_MS + 300L) return Pair(null, "The video must be 8 seconds or shorter (yours is ${dur / 1000} s)")
-            var thumbSrc: Bitmap? = null
-            for (t in listOf(0L, 2000L, 4000L, 6000L).filter { it < dur }) {
-                val f = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: continue
-                if (LocalGuard.suspicious(f)) return Pair(null, "This video looks inappropriate and cannot be posted")
-                if (thumbSrc == null || t == 2000L) thumbSrc = f
+            // uploading: only the phone checks, every second of the video
+            var thumb: String? = null
+            var t = 0L
+            while (t < dur) {
+                val f = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                if (f != null) {
+                    if (LocalGuard.suspicious(f)) return Pair(null, "This video looks inappropriate and cannot be posted")
+                    if (thumb == null) thumb = squareThumbOf(f)
+                }
+                t += 1000L
             }
-            val ts = thumbSrc ?: return Pair(null, "Could not read the video")
-            return Pair(PostPrep("video", out, squareThumbOf(ts)), "")
+            val th = thumb ?: return Pair(null, "Could not read the video")
+            return Pair(PostPrep("video", out, th), "")
         } finally {
             try { r.release() } catch (e: Exception) {}
         }
@@ -190,6 +246,8 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
     var caption by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<Api.Post?>(null) }
+    var writing by remember { mutableStateOf(false) }
+    var draft by remember { mutableStateOf("") }
 
     suspend fun refresh() {
         loading = true
@@ -225,8 +283,9 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
             horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             items(posts, key = { it.id }) { p ->
-                val bmp by produceState<ImageBitmap?>(null, p.id) { value = Remote.image("post/${p.id}/thumb", 400, true) }
+                val bmp by produceState<ImageBitmap?>(null, p.id) { value = if (p.kind == "text") null else Remote.image("post/${p.id}/thumb", 400, true) }
                 Box(Modifier.aspectRatio(1f).clip(RoundedCornerShape(6.dp)).background(Color(0xFF333333)).clickable { viewing = p }) {
+                    if (p.kind == "text") Text(p.caption, color = Color.White, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(6.dp))
                     bmp?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
                     if (p.kind == "video") Text("▶", color = Color.White, fontSize = 30.sp, modifier = Modifier.align(Alignment.Center))
                     Text(p.user, color = Color.White, fontSize = 11.sp, maxLines = 1,
@@ -239,9 +298,42 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
     if (showChoose) AlertDialog(
         onDismissRequest = { showChoose = false },
         title = { Text("New post") },
-        text = { Text("A photo, or a video of 8 seconds at most (MP4, up to 12 MB).") },
-        confirmButton = { Button({ showChoose = false; pickPhoto.launch("image/*") }) { Text("📷 Photo") } },
-        dismissButton = { OutlinedButton({ showChoose = false; pickVideo.launch("video/*") }) { Text("🎬 Video") } }
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Text only, a photo, or a video of 8 seconds at most (MP4, up to 12 MB).")
+                Button({ showChoose = false; draft = ""; msg = ""; writing = true }, Modifier.fillMaxWidth()) { Text("✏️ Text only") }
+                Button({ showChoose = false; pickPhoto.launch("image/*") }, Modifier.fillMaxWidth()) { Text("📷 Photo") }
+                OutlinedButton({ showChoose = false; pickVideo.launch("video/*") }, Modifier.fillMaxWidth()) { Text("🎬 Video") }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton({ showChoose = false }) { Text("Cancel") } }
+    )
+
+    if (writing) AlertDialog(
+        onDismissRequest = { if (!busy) writing = false },
+        title = { Text("Write a post") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedTextField(draft, { draft = it.take(500) }, label = { Text("What's on your mind?") },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 130.dp))
+                Text("${draft.length}/500", fontSize = 12.sp)
+                if (msg.isNotEmpty()) Text(msg)
+            }
+        },
+        confirmButton = {
+            Button({
+                scope.launch {
+                    busy = true; msg = "Posting…"
+                    val err = withContext(Dispatchers.IO) {
+                        try { Api.createPost(server, "text", draft.trim(), ""); "" } catch (e: Exception) { e.message ?: "Failed" }
+                    }
+                    busy = false
+                    if (err.isEmpty()) { writing = false; msg = "Posted ✓"; refresh() } else msg = err
+                }
+            }, enabled = !busy && draft.isNotBlank()) { Text("Post") }
+        },
+        dismissButton = { TextButton({ writing = false; msg = "" }, enabled = !busy) { Text("Cancel") } }
     )
 
     prep?.let { p ->
@@ -260,7 +352,7 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
                         busy = true; msg = "Uploading…"
                         val err = withContext(Dispatchers.IO) {
                             try {
-                                val id = Api.createPost(server, p.kind, caption.trim(), p.thumb)
+                                val id = Api.createPost(server, p.kind, caption.trim(), p.thumb, p.frames)
                                 Api.uploadPostData(server, id, p.file)
                             } catch (e: Exception) { e.message ?: "Failed" }
                         }
@@ -276,17 +368,24 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
     viewing?.let { p ->
         PostViewer(server, p, mine = Api.auth.isNotEmpty() && p.user.equals(user, ignoreCase = true),
             onClose = { viewing = null },
-            onDeleted = { viewing = null; scope.launch { refresh() } })
+            onDeleted = { viewing = null; scope.launch { refresh() } },
+            onRemoved = { scope.launch { refresh() } })
     }
 }
 
 @Composable
-private fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, onDeleted: () -> Unit) {
+fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, onDeleted: () -> Unit, onRemoved: () -> Unit = {}) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-            if (p.kind == "video") {
+            if (p.kind == "text") {
+                val txt by produceState<String?>(null, p.id) {
+                    value = withContext(Dispatchers.IO) { Api.fetchBytes(server, "post/${p.id}")?.toString(Charsets.UTF_8) }
+                }
+                Text(txt ?: p.caption.ifEmpty { "Loading…" }, color = Color.White, fontSize = 20.sp,
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 110.dp))
+            } else if (p.kind == "video") {
                 val path by produceState<String?>(null, p.id) {
                     value = withContext(Dispatchers.IO) {
                         val f = File(ctx.cacheDir, "post_${p.id}.mp4")
@@ -294,7 +393,12 @@ private fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -
                     }
                 }
                 val pa = path
-                if (pa == null) Text("Loading…", color = Color.White)
+                val verdict by produceState("checking", pa) {
+                    value = if (pa == null) "checking" else if (mine || p.cleared || PostChecked.has(ctx, p.id)) "ok" else withContext(Dispatchers.Default) { screenVideo(server, p.id, pa).also { if (it == "ok") PostChecked.add(ctx, p.id) } }
+                }
+                LaunchedEffect(verdict) { if (verdict == "removed") onRemoved() }
+                if (pa == null || verdict == "checking") Text("Checking…", color = Color.White)
+                else if (verdict == "removed") Text("This post was removed because it looked inappropriate.", color = Color.White, modifier = Modifier.padding(24.dp))
                 else AndroidView(factory = { c ->
                     VideoView(c).apply {
                         setVideoPath(pa)
@@ -304,7 +408,12 @@ private fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -
             } else {
                 val img by produceState<ImageBitmap?>(null, p.id) { value = Remote.image("post/${p.id}", 1600, false) }
                 val b = img
-                if (b == null) Text("Loading…", color = Color.White)
+                val verdict by produceState("checking", b) {
+                    value = if (b == null) "checking" else if (mine || p.cleared || PostChecked.has(ctx, p.id)) "ok" else withContext(Dispatchers.Default) { screenBitmap(server, p.id, b.asAndroidBitmap()).also { if (it == "ok") PostChecked.add(ctx, p.id) } }
+                }
+                LaunchedEffect(verdict) { if (verdict == "removed") onRemoved() }
+                if (b == null || verdict == "checking") Text("Checking…", color = Color.White)
+                else if (verdict == "removed") Text("This post was removed because it looked inappropriate.", color = Color.White, modifier = Modifier.padding(24.dp))
                 else Image(b, null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
             }
             Row(Modifier.align(Alignment.TopStart).statusBarsPadding().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -312,7 +421,7 @@ private fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -
                 Spacer(Modifier.width(8.dp))
                 Column {
                     Text(p.user, color = Color.White, fontSize = 15.sp)
-                    if (p.caption.isNotEmpty()) Text(p.caption, color = Color(0xFFDDDDDD), fontSize = 13.sp)
+                    if (p.caption.isNotEmpty() && p.kind != "text") Text(p.caption, color = Color(0xFFDDDDDD), fontSize = 13.sp)
                 }
             }
             Row(Modifier.align(Alignment.BottomCenter).padding(20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {

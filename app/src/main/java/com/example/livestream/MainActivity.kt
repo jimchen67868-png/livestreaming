@@ -624,7 +624,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b102-countdown"
+const val BUILD_TAG = "b111-servercleared"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -756,6 +756,7 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
             Api.profile(Api.serverUrl, name)
         }
     }
+    var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
     val following0 = remember(name) { Follows.has(fctx, name) } // state when the dialog opened (the server count already includes it)
     AlertDialog(
         onDismissRequest = onClose,
@@ -788,11 +789,12 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             rowPosts.forEach { p ->
                                 val th by produceState<ImageBitmap?>(null, p.id) {
-                                    value = withContext(Dispatchers.IO) {
+                                    value = if (p.kind == "text") null else withContext(Dispatchers.IO) {
                                         Api.fetchBytes(Api.serverUrl, "post/" + p.id + "/thumb")?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
                                     }
                                 }
-                                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp)).background(Color(0x22888888))) {
+                                Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp)).background(Color(0x22888888)).clickable { viewingPost = p }) {
+                                    if (p.kind == "text") Text(p.caption, fontSize = 11.sp, maxLines = 6, modifier = Modifier.padding(5.dp))
                                     th?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
                                     if (p.kind == "video") Text("\u25B6", color = Color.White, modifier = Modifier.align(Alignment.Center))
                                 }
@@ -804,6 +806,7 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
             }
         }
     )
+    viewingPost?.let { PostViewer(Api.serverUrl, it, mine = isMe && Api.auth.isNotEmpty(), onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
 }
 
 @Composable
@@ -1025,7 +1028,7 @@ fun HomeScreen(
         Button({ if (acct.isEmpty()) showAcct = true else onGoLive() }, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) {
             Text(if (acct.isEmpty()) "Log in to Go Live" else "Go Live")
         }
-        OutlinedButton(onPosts, Modifier.fillMaxWidth()) { Text("📷 Posts") }
+        OutlinedButton({ showAcct = true }, Modifier.fillMaxWidth()) { Text(if (acct.isEmpty()) "👤 Log in" else "👤 My profile") }
         if (showTheme) ThemeDialog(hsp) { showTheme = false }
         if (showAcct) AccountDialog(server, acct, { token, name ->
             Api.auth = token
@@ -1034,7 +1037,7 @@ fun HomeScreen(
             // logged in: the account name is your name; logged out: back to a guest name
             onSettings(server, if (name.isNotEmpty()) name else makeGuestName(hsp))
             showAcct = false
-        }) { showAcct = false }
+        }, { showAcct = false; onPosts() }) { showAcct = false }
         if (showDiag) AlertDialog(
             onDismissRequest = { showDiag = false },
             title = { Text("Diagnostics") },
