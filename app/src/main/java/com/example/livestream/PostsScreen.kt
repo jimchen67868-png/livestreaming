@@ -32,6 +32,9 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.material3.Surface
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -108,6 +111,19 @@ private fun checkB64(b: Bitmap): String {
     var s = jpegB64(sc, q)
     while (s.length > 60000 && q > 20) { q -= 10; s = jpegB64(sc, q) }
     return s
+}
+
+// "just now", "5m ago", "3h ago", "2d ago", then the date
+fun timeAgo(ts: Long): String {
+    if (ts <= 0L) return ""
+    val sec = (System.currentTimeMillis() - ts) / 1000
+    return when {
+        sec < 60 -> "just now"
+        sec < 3600 -> "${sec / 60}m ago"
+        sec < 86400 -> "${sec / 3600}h ago"
+        sec < 7 * 86400 -> "${sec / 86400}d ago"
+        else -> java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(ts))
+    }
 }
 
 // posts this phone has already checked and found fine (not checked again when opened later)
@@ -235,13 +251,13 @@ private fun prepareVideo(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, Str
 }
 
 @Composable
-fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
+fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var posts by remember { mutableStateOf(listOf<Api.Post>()) }
     var loading by remember { mutableStateOf(true) }
     var msg by remember { mutableStateOf("") }
-    var showChoose by remember { mutableStateOf(false) }
+    var showChoose by remember { mutableStateOf(openNew) } // from the profile page the "new post" choices open at once
     var prep by remember { mutableStateOf<PostPrep?>(null) }
     var caption by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -288,7 +304,7 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
                     if (p.kind == "text") Text(p.caption, color = Color.White, fontSize = 12.sp, maxLines = 6, modifier = Modifier.padding(6.dp))
                     bmp?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
                     if (p.kind == "video") Text("▶", color = Color.White, fontSize = 30.sp, modifier = Modifier.align(Alignment.Center))
-                    Text(p.user, color = Color.White, fontSize = 11.sp, maxLines = 1,
+                    Text(p.user + (if (p.ts > 0L) "\n" + timeAgo(p.ts) else ""), color = Color.White, fontSize = 11.sp, maxLines = 2,
                         modifier = Modifier.align(Alignment.BottomStart).background(Color(0x88000000)).padding(horizontal = 5.dp, vertical = 2.dp))
                 }
             }
@@ -342,7 +358,8 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
             title = { Text(if (p.kind == "video") "Post this video" else "Post this picture") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(caption, { caption = it.take(100) }, label = { Text("Caption (optional)") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(caption, { caption = it.take(300) }, label = { Text("Write something (optional)") }, modifier = Modifier.fillMaxWidth().heightIn(min = 100.dp))
+                    Text("${caption.length}/300", fontSize = 12.sp)
                     if (msg.isNotEmpty()) Text(msg)
                 }
             },
@@ -377,6 +394,12 @@ fun PostsScreen(server: String, user: String, onBack: () -> Unit) {
 fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, onDeleted: () -> Unit, onRemoved: () -> Unit = {}) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    val me = remember { ctx.getSharedPreferences("s", 0).getString("acct", "") ?: "" }
+    var info by remember { mutableStateOf<Api.PostInfo?>(null) }
+    var showComments by remember { mutableStateOf(false) }
+    var draft by remember { mutableStateOf("") }
+    var cmsg by remember { mutableStateOf("") }
+    LaunchedEffect(p.id) { info = withContext(Dispatchers.IO) { Api.postInfo(server, p.id) } }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
             if (p.kind == "text") {
@@ -421,17 +444,66 @@ fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, 
                 Spacer(Modifier.width(8.dp))
                 Column {
                     Text(p.user, color = Color.White, fontSize = 15.sp)
-                    if (p.caption.isNotEmpty() && p.kind != "text") Text(p.caption, color = Color(0xFFDDDDDD), fontSize = 13.sp)
+                    if (p.ts > 0L) Text(timeAgo(p.ts), color = Color(0xFFBBBBBB), fontSize = 12.sp)
+                    if (p.caption.isNotEmpty() && p.kind != "text") {
+                        // the list only carries the first 100 characters; longer text is fetched
+                        val fullText by produceState(p.caption, p.id) {
+                            if (p.caption.length >= 100) value = withContext(Dispatchers.IO) { Api.fetchBytes(server, "post/${p.id}/text")?.toString(Charsets.UTF_8)?.ifEmpty { null } } ?: p.caption
+                        }
+                        Text(fullText, color = Color(0xFFDDDDDD), fontSize = 13.sp)
+                    }
                 }
             }
-            Row(Modifier.align(Alignment.BottomCenter).padding(20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedButton(onClose) { Text("Close") }
-                if (mine) OutlinedButton({
-                    scope.launch {
-                        val ok = withContext(Dispatchers.IO) { Api.deletePost(server, p.id) }
-                        if (ok) onDeleted()
+            Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                if (showComments) Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = Color(0xEE111118)) {
+                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        val cs = info?.comments.orEmpty()
+                        Column(Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            if (cs.isEmpty()) Text("No comments yet", color = Color(0xFFBBBBBB), fontSize = 13.sp)
+                            cs.forEach { c ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(c.user + "  " + timeAgo(c.ts), color = Color(0xFFFFD54F), fontSize = 11.sp)
+                                        Text(c.text, color = Color.White, fontSize = 14.sp)
+                                    }
+                                    if (mine || (me.isNotEmpty() && c.user.equals(me, ignoreCase = true))) TextButton({
+                                        scope.launch { withContext(Dispatchers.IO) { Api.uncomment(server, p.id, c.ts) }?.let { info = it } }
+                                    }) { Text("✕", color = Color.White) }
+                                }
+                            }
+                        }
+                        if (me.isEmpty()) Text("Log in to comment", color = Color(0xFFBBBBBB), fontSize = 13.sp)
+                        else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedTextField(draft, { draft = it.take(200) }, Modifier.weight(1f), singleLine = true,
+                                textStyle = LocalTextStyle.current.copy(color = Color.White), placeholder = { Text("Add a comment…") })
+                            Button({
+                                val text = draft.trim()
+                                scope.launch {
+                                    val r = withContext(Dispatchers.IO) { Api.commentPost(server, p.id, text) }
+                                    if (r != null) { info = r; draft = ""; cmsg = "" } else cmsg = "Could not send the comment"
+                                }
+                            }, enabled = draft.isNotBlank()) { Text("Send") }
+                        }
+                        if (cmsg.isNotEmpty()) Text(cmsg, color = Color(0xFFFF8A80), fontSize = 12.sp)
                     }
-                }) { Text("Delete") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val liked = info?.liked == true
+                    OutlinedButton({
+                        if (me.isEmpty()) { cmsg = "Log in to like"; showComments = true }
+                        else scope.launch { withContext(Dispatchers.IO) { Api.likePost(server, p.id, !liked) }?.let { info = it } }
+                    }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text((if (liked) "❤️ " else "🤍 ") + compactNum((info?.likes ?: 0).toLong())) }
+                    OutlinedButton({ showComments = !showComments }, contentPadding = PaddingValues(horizontal = 12.dp)) {
+                        Text("💬 " + compactNum((info?.comments?.size ?: 0).toLong()))
+                    }
+                    OutlinedButton(onClose, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Close") }
+                    if (mine) OutlinedButton({
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) { Api.deletePost(server, p.id) }
+                            if (ok) onDeleted()
+                        }
+                    }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Delete") }
+                }
             }
         }
     }

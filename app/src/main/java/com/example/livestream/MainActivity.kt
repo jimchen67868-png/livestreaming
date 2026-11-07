@@ -177,6 +177,7 @@ fun App() {
     remember { Api.auth = sp.getString("auth", "") ?: ""; true }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var postsReturn by remember { mutableStateOf<Screen>(Screen.Home) } // where Back goes from the Posts screen
+    var postsNew by remember { mutableStateOf(false) } // open the Posts screen with the new-post choices already showing
     // a tapped "is live" notification: go straight into that live (not while you are broadcasting)
     val wanted = OpenRoom.pending.value
     LaunchedEffect(wanted) {
@@ -195,11 +196,11 @@ fun App() {
     when (val s = screen) {
         Screen.Home -> HomeScreen(server, user,
             { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
-            { screen = Screen.Watch(it) }, { screen = Screen.Live }, { postsReturn = Screen.Home; screen = Screen.Posts }, { screen = Screen.MyProfile })
-        Screen.Posts -> PostsScreen(server, user) { screen = postsReturn }
+            { screen = Screen.Watch(it) }, { screen = Screen.Live }, { postsReturn = Screen.Home; postsNew = false; screen = Screen.Posts }, { screen = Screen.MyProfile })
+        Screen.Posts -> PostsScreen(server, user, postsNew) { screen = postsReturn }
         Screen.MyProfile -> MyProfileScreen(server, user,
             { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
-            { postsReturn = Screen.MyProfile; screen = Screen.Posts }) { screen = Screen.Home }
+            { postsReturn = Screen.MyProfile; postsNew = true; screen = Screen.Posts }) { screen = Screen.Home }
         is Screen.Watch -> key(s.stream.id) {
             WatchScreen(server, user, s.stream, { id -> screen = Screen.Watch(Api.Stream(id, "PK battle", "", 0)) }) {
                 screen = Screen.Home
@@ -629,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b113-hostinlist"
+const val BUILD_TAG = "b123-restrict"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -721,7 +722,7 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
                         Row(Modifier.weight(1f).clickable { profileFor = n }.padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                             Avatar(clean, 30.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text(if (isHostRow) "\uD83D\uDC51 " + n.replace(" (you) (host)", " (host, you)") else n)
+                            Text(if (isHostRow) n.replace(" (you) (host)", " (host, you)") else n)
                         }
                         // the host can send a gift to a viewer (a different set from the gifts viewers send to the host)
                         if (onGift != null && !isYou && !isHostRow) {
@@ -770,16 +771,16 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
         text = {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Avatar(name, 96.dp)
-                Text(if (isHost) "\uD83D\uDC51 $name" else name, style = MaterialTheme.typography.titleLarge)
+                Text(name, style = MaterialTheme.typography.titleLarge)
                 Text(when { isHost -> "Broadcaster"; guest -> "Guest (no profile)"; isMe -> "This is you"; else -> "Member" }, style = MaterialTheme.typography.bodySmall)
                 if (!guest) {
                     val nowFollowing = tick >= 0 && Follows.has(fctx, name)
                     val adj = (if (nowFollowing) 1 else 0) - (if (following0) 1 else 0)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        StatBox("Received", info?.received?.toString() ?: "-")
-                        StatBox("Spent", info?.spent?.toString() ?: "-")
-                        StatBox("Followers", info?.let { (it.followers + adj).coerceAtLeast(0).toString() } ?: "-")
-                        StatBox("Following", info?.following?.toString() ?: "-")
+                        StatBox("Received", info?.received?.let { compactNum(it) } ?: "-")
+                        StatBox("Spent", info?.spent?.let { compactNum(it) } ?: "-")
+                        StatBox("Followers", info?.let { compactNum((it.followers + adj).coerceAtLeast(0).toLong()) } ?: "-")
+                        StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
                     }
                 }
                 cover?.let { Image(it, null, Modifier.size(140.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop) }
@@ -828,13 +829,6 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             Api.profile(Api.serverUrl, user)
         }
     }
-    val cover by produceState<ImageBitmap?>(null, user) {
-        value = withContext(Dispatchers.IO) {
-            Api.fetchBytes(Api.serverUrl, "cover?u=" + java.net.URLEncoder.encode(user, "UTF-8"))?.let {
-                BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap()
-            }
-        }
-    }
     BackHandler(onBack = onBack)
     Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -847,16 +841,12 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             Text(user, style = MaterialTheme.typography.titleLarge)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            StatBox("Received", info?.received?.toString() ?: "-")
-            StatBox("Spent", info?.spent?.toString() ?: "-")
-            StatBox("Followers", info?.followers?.toString() ?: "-")
-            StatBox("Following", info?.following?.toString() ?: "-")
+            StatBox("Received", info?.received?.let { compactNum(it) } ?: "-")
+            StatBox("Spent", info?.spent?.let { compactNum(it) } ?: "-")
+            StatBox("Followers", info?.followers?.let { compactNum(it.toLong()) } ?: "-")
+            StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
         }
-        cover?.let {
-            Text("Live cover", style = MaterialTheme.typography.bodySmall)
-            Image(it, null, Modifier.size(140.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
-        }
-        Button(onPosts, Modifier.fillMaxWidth()) { Text("➕ New post (text, photo or video)") }
+        Button(onPosts, Modifier.fillMaxWidth()) { Text("➕ Add post") }
         val posts = info?.posts.orEmpty()
         Text(if (info == null) "Loading..." else if (posts.isEmpty()) "No posts yet" else "My posts", style = MaterialTheme.typography.titleSmall)
         posts.chunked(3).forEach { rowPosts ->
@@ -885,6 +875,19 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
         if (name.isEmpty()) onBack() // logged out: nothing to show
     }, { showAcct = false; onPosts() }) { showAcct = false }
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = true, onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
+}
+
+// 1234 -> 1.2k, 1500000 -> 1.5M (cut, not rounded up)
+fun compactNum(n: Long): String {
+    fun one(v: Double, suf: String): String {
+        val t = Math.floor(v * 10) / 10
+        return (if (t == Math.floor(t)) t.toLong().toString() else t.toString()) + suf
+    }
+    return when {
+        n >= 1_000_000L -> one(n / 1_000_000.0, "M")
+        n >= 1_000L -> one(n / 1_000.0, "k")
+        else -> n.toString()
+    }
 }
 
 @Composable
@@ -1146,6 +1149,8 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
     var fillMode by rememberSaveable { mutableStateOf(false) }
     var chatHidden by rememberSaveable { mutableStateOf(false) }
     var guestV by remember { mutableStateOf<VideoTrack?>(null) }
+    var blockedHost by remember { mutableStateOf(false) } // the host's phone found possible nudity: black screen until it is checked
+    var blockedGuest by remember { mutableStateOf(false) }
     var ended by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Connecting…") }
     var showViewers by remember { mutableStateOf(false) }
@@ -1195,6 +1200,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                                     } else pk = listOf(o.optInt("l"), o.optInt("r"), o.optInt("left"))
                                 }
                                 "goto" -> if (fromHost) onSwitch(o.optString("room"))
+                                "blk" -> if (fromHost) blockedHost = o.optBoolean("on") else if (isGuest(e.participant?.identity?.value)) blockedGuest = o.optBoolean("on")
                                 "yt" -> if (fromHost) yt = if (o.optString("id").isEmpty()) null else o
                             }
                         }
@@ -1260,8 +1266,17 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     Text("🎙", style = MaterialTheme.typography.displayLarge, modifier = Modifier.align(Alignment.Center))
                 if (screenV != null && hostV != null) VideoView(lk, hostV,
                     Modifier.align(Alignment.BottomEnd).padding(8.dp).size(84.dp, 120.dp))
+                // the host's phone detected possible nudity: black first, the picture comes back after the check
+                if (blockedHost) Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+                    Text("Video paused while it is checked", color = Color(0xFFBBBBBB))
+                }
             }
-            if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
+            if (guestV != null) Box(Modifier.weight(1f).fillMaxHeight()) {
+                VideoView(lk, guestV, Modifier.fillMaxSize())
+                if (blockedGuest) Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+                    Text("Video paused while it is checked", color = Color(0xFFBBBBBB))
+                }
+            }
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
             Row(Modifier.fillMaxWidth()
@@ -1470,7 +1485,11 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         }
                         "pk_invite" -> if (!pkActive && live) invite = Pair(o.optString("room"), o.optString("name"))
                         "warn" -> if (e.participant == null) notice = "⚠️ Warning: nudity detected. Next time your live will be ended."
-                        "ended" -> if (e.participant == null) { status = "Ended: policy violation"; notice = "Your live was ended for breaking the nudity policy." }
+                        "ended" -> if (e.participant == null) {
+                            val mins = o.optInt("mins")
+                            status = "Ended: policy violation"
+                            notice = "Your live was ended for breaking the nudity policy." + (if (mins > 0) " You cannot go live for " + (if (mins < 60) "$mins minutes" else if (mins == 60) "1 hour" else "${mins / 60} hours") + "." else "")
+                        }
                     }
                 }
                 is RoomEvent.ParticipantConnected -> {
@@ -1609,6 +1628,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 if (h != null) {
                     // blocked on this phone: once the server may check, verify the held frame
                     if (notice.isEmpty()) notice = "⚠️ Video blocked while it is checked."
+                    try { lk.send(JSONObject().put("t", "blk").put("on", true)) } catch (e: Exception) {} // also for viewers who join meanwhile
                     if (now - lastCheck > 30000) {
                         lastCheck = now
                         val img = jpegB64(h, 75)
@@ -1621,6 +1641,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                                 lk.localParticipant.setCameraEnabled(true)
                                 cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
                             } catch (e: Exception) { status = "Camera error: ${e.message}" }
+                            try { lk.send(JSONObject().put("t", "blk").put("on", false)) } catch (e: Exception) {}
                         }
                         // not clean: the server ends the live and the "ended" message does the rest
                     }
@@ -1628,8 +1649,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                     val frame = if (kind == "audio") null else renderer?.let { captureFrame(it) }
                     if (frame != null) {
                         if (withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
-                            // local detection: block the video on this phone right away
+                            // local detection: black screen first (here and for the viewers), then block the camera
                             held = frame
+                            try { lk.send(JSONObject().put("t", "blk").put("on", true)) } catch (e: Exception) {}
                             notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
                             if (sharing) { try { lk.localParticipant.setScreenShareEnabled(false) } catch (e: Exception) {}; sharing = false }
                             try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
@@ -1660,7 +1682,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                         }
                     }
                 }
-                delay(5000)
+                delay(2500)
             }
         }
     }
@@ -1681,6 +1703,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 val fr = ratioValue(ratio)
                 VideoView(lk, cam ?: preview, if (fr != null) Modifier.aspectRatio(fr) else Modifier.fillMaxSize(),
                     onReady = { renderer = it }, scaleFill = if (fr != null) true else null)
+                if (held != null) Box(Modifier.fillMaxSize().background(Color.Black)) // possible nudity: black first, no frozen picture
             }
             if (guestV != null) VideoView(lk, guestV, Modifier.weight(1f).fillMaxHeight())
         }
@@ -1737,20 +1760,26 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             AlertDialog(
                 onDismissRequest = { showPick = false },
                 confirmButton = { TextButton({ showPick = false }) { Text("Cancel") } },
-                title = { Text("PK with…") },
+                title = { Text("Start a PK") },
                 text = {
-                    Column {
+                    Column(Modifier.verticalScroll(rememberScrollState())) {
+                        fun sendInvite(s: Api.Stream) {
+                            showPick = false
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) { Api.invite(server, s.id, roomId, user, hostKey) }
+                                    status = "Invite sent to ${s.host}"
+                                } catch (e: Exception) { status = "Invite failed" }
+                            }
+                        }
                         if (list.isEmpty()) Text("No other live streams")
+                        else {
+                            // random PK: one of the other live hosts, picked by chance
+                            Button({ sendInvite(list.random()) }, Modifier.fillMaxWidth()) { Text("🎲 Random PK") }
+                            Text("or choose who to PK with:", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                        }
                         list.forEach { s ->
-                            TextButton({
-                                showPick = false
-                                scope.launch {
-                                    try {
-                                        withContext(Dispatchers.IO) { Api.invite(server, s.id, roomId, user, hostKey) }
-                                        status = "Invite sent to ${s.host}"
-                                    } catch (e: Exception) { status = "Invite failed" }
-                                }
-                            }) { Text("${s.title} (${s.host})") }
+                            TextButton({ sendInvite(s) }) { Text("${s.title} (${s.host})") }
                         }
                     }
                 }
@@ -1843,7 +1872,11 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                                     } else pk = listOf(o.optInt("l"), o.optInt("r"), o.optInt("left"))
                                 }
                                 "warn" -> if (e.participant == null) notice = "⚠️ Warning: nudity detected. Next time you will be removed."
-                                "ended" -> if (e.participant == null) { notice = "You were removed for breaking the nudity policy."; delay(2500); onBack() }
+                                "ended" -> if (e.participant == null) {
+                            val mins = o.optInt("mins")
+                            notice = "You were removed for breaking the nudity policy." + (if (mins > 0) " You cannot join a PK for " + (if (mins < 60) "$mins minutes" else if (mins == 60) "1 hour" else "${mins / 60} hours") + "." else "")
+                            delay(4000); onBack()
+                        }
                             }
                         }
                         is RoomEvent.ParticipantDisconnected -> {
@@ -1874,6 +1907,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
             val h = held
             if (h != null) {
                 if (notice.isEmpty()) notice = "⚠️ Video blocked while it is checked."
+                try { lk.send(JSONObject().put("t", "blk").put("on", true)) } catch (e: Exception) {}
                 if (now - lastCheck > 30000) {
                     lastCheck = now
                     val img = jpegB64(h, 75)
@@ -1882,6 +1916,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                     }
                     if (clean) {
                         held = null; notice = ""
+                        try { lk.send(JSONObject().put("t", "blk").put("on", false)) } catch (e: Exception) {}
                         try {
                             lk.localParticipant.setCameraEnabled(true)
                             cam = lk.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack
@@ -1892,6 +1927,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                 val frame = myRenderer?.let { captureFrame(it) }
                 if (frame != null && withContext(Dispatchers.Default) { LocalGuard.suspicious(frame) }) {
                     held = frame
+                    try { lk.send(JSONObject().put("t", "blk").put("on", true)) } catch (e: Exception) {} // viewers see black first
                     notice = "⚠️ Possible nudity detected. Your video is blocked until it is checked."
                     try { lk.localParticipant.setCameraEnabled(false) } catch (e: Exception) {}
                     cam = null
@@ -1912,7 +1948,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
                     } catch (e: Exception) {}
                 }
             }
-            delay(5000)
+            delay(2500)
         }
     }
     DisposableEffect(Unit) { onDispose { lk.disconnect(); lk.release() } }
@@ -1921,7 +1957,10 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Row(Modifier.fillMaxSize()) {
             VideoView(lk, hostV, Modifier.weight(1f).fillMaxHeight())
-            VideoView(lk, cam, Modifier.weight(1f).fillMaxHeight(), onReady = { myRenderer = it })
+            Box(Modifier.weight(1f).fillMaxHeight()) {
+                VideoView(lk, cam, Modifier.fillMaxSize(), onReady = { myRenderer = it })
+                if (held != null) Box(Modifier.fillMaxSize().background(Color.Black)) // black first, no frozen picture
+            }
         }
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding()) {
             Text("PK • $status", color = Color.White, modifier = Modifier.padding(12.dp))

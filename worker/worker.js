@@ -63,21 +63,42 @@ async function nudityScore(env, b64) {
   } catch { return null; }
 }
 // score >= 0.8, or a second offence: end it. Otherwise warn.
+// ---------- restriction after a confirmed nudity detection ----------
+// 1st time: no live for 5 minutes, 2nd time: 1 hour, 3rd time and later: 24 hours. The count starts over after 30 days without a violation.
+const BAN_MS = [5 * 60000, 60 * 60000, 24 * 3600000];
+async function restrict(env, name) {
+  if (!env.DB || !name) return 0;
+  const k = String(name).toLowerCase();
+  const n = (parseInt(await env.DB.get('ho:' + k), 10) || 0) + 1;
+  await env.DB.put('ho:' + k, String(n), { expirationTtl: 30 * 86400 });
+  const ms = BAN_MS[Math.min(n, BAN_MS.length) - 1];
+  await env.DB.put('hb:' + k, String(Date.now() + ms), { expirationTtl: Math.ceil(ms / 1000) + 60 });
+  return Math.round(ms / 60000); // minutes
+}
+// how many ms this account is still restricted (0 = free)
+async function banLeft(env, name) {
+  if (!env.DB || !name) return 0;
+  const until = parseInt(await env.DB.get('hb:' + String(name).toLowerCase()), 10) || 0;
+  return Math.max(0, until - Date.now());
+}
+const banText = (ms) => {
+  const m = Math.ceil(ms / 60000);
+  return m < 60 ? m + (m === 1 ? ' minute' : ' minutes') : Math.ceil(m / 60) + (Math.ceil(m / 60) === 1 ? ' hour' : ' hours');
+};
+async function guestName(env, room) {
+  const d = await twirp(env, 'ListParticipants', { roomAdmin: true, room }, { room });
+  const p = (d.participants || []).find((x) => String(x.identity).startsWith('guest-'));
+  return p ? p.name : '';
+}
+
+// the server confirmed nudity: the live (or the PK guest) is ended at once and the account is restricted
 async function flag(env, id, who, score, m) {
-  const key = who === 'guest' ? 'gs' : 'hs';
-  const strikes = m[key] || 0;
   const target = who === 'guest' ? await guestIdentity(env, id) : 'host-' + id;
-  if (score >= 0.8 || strikes >= 1) {
-    if (target) await sendData(env, id, [target], { t: 'ended', why: 'policy' });
-    if (who === 'guest') { if (target) await twirp(env, 'RemoveParticipant', { roomAdmin: true, room: id }, { room: id, identity: target }); }
-    else await twirp(env, 'DeleteRoom', { roomCreate: true }, { room: id });
-    return 'ended';
-  }
-  m[key] = strikes + 1;
-  if (who === 'host') m.thumb = '';
-  await updateMeta(env, id, m);
-  if (target) await sendData(env, id, [target], { t: 'warn' });
-  return 'warned';
+  const mins = await restrict(env, who === 'guest' ? await guestName(env, id) : m.host);
+  if (target) await sendData(env, id, [target], { t: 'ended', why: 'policy', mins });
+  if (who === 'guest') { if (target) await twirp(env, 'RemoveParticipant', { roomAdmin: true, room: id }, { room: id, identity: target }); }
+  else await twirp(env, 'DeleteRoom', { roomCreate: true }, { room: id });
+  return 'ended';
 }
 
 const hmac = async (env, msg) => {
@@ -225,7 +246,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b111', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b123', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -300,7 +321,7 @@ export default {
           return json({ id });
         }
         await env.DB.put('pt:' + id, thumb);
-        await env.DB.put('pp:' + id, JSON.stringify({ user: who, kind, caption: String(b.caption || '').slice(0, 100) }), { expirationTtl: 3600 });
+        await env.DB.put('pp:' + id, JSON.stringify({ user: who, kind, caption: String(b.caption || '').trim().slice(0, 300) }), { expirationTtl: 3600 });
         return json({ id });
       }
       // second opinion for the poster's phone: it only asks when its own check flagged a picture
@@ -333,6 +354,9 @@ export default {
         if (sc !== null && sc >= 0.6) {
           await env.DB.delete('pd:' + id);
           await env.DB.delete('pt:' + id);
+          await env.DB.delete('px:' + id);
+          await env.DB.delete('pl:' + id);
+          await env.DB.delete('pc:' + id);
           await env.DB.delete('pm:' + id);
           return json({ removed: true });
         }
@@ -354,7 +378,8 @@ export default {
         const isMp4 = h[4] === 0x66 && h[5] === 0x74 && h[6] === 0x79 && h[7] === 0x70;
         if (pend.kind === 'photo' ? !isJpeg : !isMp4) return json({ error: 'unsupported file (photo: JPEG, video: MP4)' }, 400);
         await env.DB.put('pd:' + id, buf, { metadata: { k: pend.kind } });
-        await env.DB.put('pm:' + id, '', { metadata: { u: pend.user, k: pend.kind, c: pend.caption, t: Date.now() } });
+        if (pend.caption.length > 100) await env.DB.put('px:' + id, pend.caption); // longer text of a photo / video post
+        await env.DB.put('pm:' + id, '', { metadata: { u: pend.user, k: pend.kind, c: pend.caption.slice(0, 100), t: Date.now() } });
         await env.DB.delete('pp:' + id);
         return json({ ok: true, id });
       }
@@ -363,6 +388,58 @@ export default {
         const l = await env.DB.list({ prefix: 'pm:', limit: 60 }); // newest first (ids count down)
         return json(l.keys.map((k) => ({ id: k.name.slice(3), user: (k.metadata || {}).u || '', kind: (k.metadata || {}).k || 'photo',
           caption: (k.metadata || {}).c || '', ts: (k.metadata || {}).t || 0, v: !!(k.metadata || {}).v })));
+      }
+      // ---------- likes and comments on posts ----------
+      // KV: pl:<id> = JSON list of the names that liked, pc:<id> = JSON list of comments {u, t, ts} (latest 100)
+      const pin = u.pathname.match(/^\/post\/(\w+)\/(info|like|comment|uncomment)$/);
+      if (pin) {
+        if (!env.DB) return json({ error: 'no storage' }, 503);
+        const id = pin[1];
+        const act = pin[2];
+        const pmx = await env.DB.getWithMetadata('pm:' + id);
+        if (!pmx.metadata) return json({ error: 'This post is gone' }, 404);
+        const me = await userOf(req, env); // null for guests
+        const likes = (await env.DB.get('pl:' + id, 'json')) || [];
+        const comments = (await env.DB.get('pc:' + id, 'json')) || [];
+        const view = () => json({ likes: likes.length, liked: !!me && likes.includes(me.toLowerCase()), comments: comments.slice(-100) });
+        if (req.method === 'GET' && act === 'info') return view();
+        if (req.method !== 'POST') return json({ error: 'bad request' }, 405);
+        if (!me) return json({ error: 'Log in first' }, 401);
+        const b = await req.json().catch(() => ({}));
+        const mk = me.toLowerCase();
+        if (act === 'like') {
+          const has = likes.includes(mk);
+          if (b.on && !has) likes.push(mk);
+          else if (!b.on && has) likes.splice(likes.indexOf(mk), 1);
+          else return view();
+          await env.DB.put('pl:' + id, JSON.stringify(likes.slice(-5000)));
+          return view();
+        }
+        if (act === 'comment') {
+          const text = String(b.text || '').trim().slice(0, 200);
+          if (!text) return json({ error: 'Write something first' }, 400);
+          const ck = 'cd:' + mk + ':' + new Date().toISOString().slice(0, 10); // 30 comments per account per day
+          const n = parseInt(await env.DB.get(ck), 10) || 0;
+          if (n >= 30) return json({ error: 'Comment limit for today reached' }, 429);
+          await env.DB.put(ck, String(n + 1), { expirationTtl: 172800 });
+          comments.push({ u: me, t: text, ts: Date.now() });
+          await env.DB.put('pc:' + id, JSON.stringify(comments.slice(-100)));
+          return view();
+        }
+        // uncomment: the writer or the owner of the post can remove a comment
+        const owner = String(pmx.metadata.u || '').toLowerCase() === mk;
+        const idx = comments.findIndex((c) => c.ts === Number(b.ts) && (owner || String(c.u).toLowerCase() === mk));
+        if (idx >= 0) {
+          comments.splice(idx, 1);
+          await env.DB.put('pc:' + id, JSON.stringify(comments));
+        }
+        return view();
+      }
+      // the full text of a photo / video post
+      const ptx = u.pathname.match(/^\/post\/(\w+)\/text$/);
+      if (req.method === 'GET' && ptx) {
+        const full = env.DB ? await env.DB.get('px:' + ptx[1]) : null;
+        return new Response(full || '', { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
       }
       const pgm = u.pathname.match(/^\/post\/(\w+)(\/thumb)?$/);
       if (req.method === 'GET' && pgm) {
@@ -389,6 +466,9 @@ export default {
         await env.DB.delete('pm:' + pgm[1]);
         await env.DB.delete('pd:' + pgm[1]);
         await env.DB.delete('pt:' + pgm[1]);
+        await env.DB.delete('px:' + pgm[1]);
+        await env.DB.delete('pl:' + pgm[1]);
+        await env.DB.delete('pc:' + pgm[1]);
         return json({ ok: true });
       }
       // Live cover picture: set on the profile page (not while live), reused for every live of that account
@@ -498,6 +578,8 @@ export default {
         const t = String(title || 'Live').slice(0, 60);
         const h = await userOf(req, env); // only logged-in accounts can host
         if (!h) return json({ error: 'Log in to go live (the 👤 button on Home).' }, 401);
+        const left = await banLeft(env, h);
+        if (left > 0) return json({ error: 'You cannot go live for ' + banText(left) + ' because your last live broke the nudity policy.', restricted: true }, 403);
         await twirp(env, 'CreateRoom', { roomCreate: true },
           { name: id, metadata: JSON.stringify({ title: t, host: h, kind: k, ratio: rr, cc: ccOf(req) }), empty_timeout: 30 });
         const token = await sign(env, { sub: 'host-' + id, name: h,
@@ -559,6 +641,8 @@ export default {
         const from = u.searchParams.get('from');
         const name = await userOf(req, env); // only logged-in accounts can join a PK as a guest
         if (!name) return json({ error: 'Log in to join a PK (the 👤 button on Home).' }, 401);
+        const gleft = await banLeft(env, name);
+        if (gleft > 0) return json({ error: 'You cannot join a PK for ' + banText(gleft) + ' because your last video broke the nudity policy.', restricted: true }, 403);
         const d = await twirp(env, 'ListRooms', { roomList: true }, { names: [room] });
         const r = (d.rooms || [])[0];
         if (!r) return json({ error: 'no room' }, 404);

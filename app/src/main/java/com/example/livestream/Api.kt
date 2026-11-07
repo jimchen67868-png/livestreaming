@@ -167,6 +167,31 @@ object Api {
         }
     } catch (e: Exception) { "ok" }
 
+    data class PostComment(val user: String, val text: String, val ts: Long)
+    data class PostInfo(val likes: Int, val liked: Boolean, val comments: List<PostComment>)
+
+    /** Likes + comments of a post. body == null reads (GET); otherwise act is like / comment / uncomment. Null = failed. */
+    private fun postCall(server: String, id: String, act: String, body: JSONObject?): PostInfo? = try {
+        val b = Request.Builder().url("${base(server)}/post/$id/$act")
+        if (auth.isNotEmpty()) b.header("X-Auth", auth)
+        if (body != null) b.post(body.toString().toRequestBody("application/json".toMediaType()))
+        http.newCall(b.build()).execute().use { r ->
+            if (!r.isSuccessful) null else {
+                val o = JSONObject(r.body!!.string())
+                val a = o.optJSONArray("comments") ?: JSONArray()
+                PostInfo(o.optInt("likes"), o.optBoolean("liked"), (0 until a.length()).map {
+                    val c = a.getJSONObject(it)
+                    PostComment(c.optString("u"), c.optString("t"), c.optLong("ts"))
+                })
+            }
+        }
+    } catch (e: Exception) { null }
+
+    fun postInfo(server: String, id: String) = postCall(server, id, "info", null)
+    fun likePost(server: String, id: String, on: Boolean) = postCall(server, id, "like", JSONObject().put("on", on))
+    fun commentPost(server: String, id: String, text: String) = postCall(server, id, "comment", JSONObject().put("text", text))
+    fun uncomment(server: String, id: String, ts: Long) = postCall(server, id, "uncomment", JSONObject().put("ts", ts))
+
     fun deletePost(server: String, id: String): Boolean = try {
         http.newCall(Request.Builder().url("${base(server)}/post/$id").header("X-Auth", auth).delete().build()).execute().use { it.isSuccessful }
     } catch (e: Exception) { false }
