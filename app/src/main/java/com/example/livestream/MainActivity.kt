@@ -162,6 +162,7 @@ sealed interface Screen {
     data class Watch(val stream: Api.Stream) : Screen
     object Live : Screen
     object Posts : Screen
+    object MyProfile : Screen
     data class Guest(val room: String, val from: String) : Screen
 }
 
@@ -175,6 +176,7 @@ fun App() {
     var user by remember { mutableStateOf(sp.getString("acct", "")?.takeIf { it.isNotEmpty() } ?: makeGuestName(sp)) }
     remember { Api.auth = sp.getString("auth", "") ?: ""; true }
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+    var postsReturn by remember { mutableStateOf<Screen>(Screen.Home) } // where Back goes from the Posts screen
     // a tapped "is live" notification: go straight into that live (not while you are broadcasting)
     val wanted = OpenRoom.pending.value
     LaunchedEffect(wanted) {
@@ -193,8 +195,11 @@ fun App() {
     when (val s = screen) {
         Screen.Home -> HomeScreen(server, user,
             { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
-            { screen = Screen.Watch(it) }, { screen = Screen.Live }, { screen = Screen.Posts })
-        Screen.Posts -> PostsScreen(server, user) { screen = Screen.Home }
+            { screen = Screen.Watch(it) }, { screen = Screen.Live }, { postsReturn = Screen.Home; screen = Screen.Posts }, { screen = Screen.MyProfile })
+        Screen.Posts -> PostsScreen(server, user) { screen = postsReturn }
+        Screen.MyProfile -> MyProfileScreen(server, user,
+            { sv, u -> server = sv; user = u; sp.edit().putString("server", sv).putString("user", u).apply() },
+            { postsReturn = Screen.MyProfile; screen = Screen.Posts }) { screen = Screen.Home }
         is Screen.Watch -> key(s.stream.id) {
             WatchScreen(server, user, s.stream, { id -> screen = Screen.Watch(Api.Stream(id, "PK battle", "", 0)) }) {
                 screen = Screen.Home
@@ -624,7 +629,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b111-servercleared"
+const val BUILD_TAG = "b113-hostinlist"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -698,31 +703,32 @@ fun ViewerListDialog(names: List<String>, onGift: ((String, String) -> Unit)? = 
     var tick by remember { mutableStateOf(0) }
     var giftFor by remember { mutableStateOf("") }
     var profileFor by remember { mutableStateOf("") }
-    if (profileFor.isNotEmpty()) ProfileDialog(profileFor.removeSuffix(" (you)").removeSuffix(" (host)"), profileFor.endsWith(" (host)"), profileFor.endsWith(" (you)")) { profileFor = "" }
+    if (profileFor.isNotEmpty()) ProfileDialog(profileFor.replace(" (you)", "").replace(" (host)", ""), profileFor.endsWith(" (host)"), profileFor.contains(" (you)")) { profileFor = "" }
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
         title = { Text("Viewers (${names.count { !it.endsWith(" (host)") }})") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (names.isEmpty()) Text("No viewers yet")
+                if (names.size <= 1) Text("No viewers yet")
                 // host first, then registered users, then guests; A-Z inside each group
                 names.sortedWith(compareBy<String>({ !it.endsWith(" (host)") }, { isGuestAccount(it) }, { it.lowercase() })).forEach { n ->
-                    val clean = n.removeSuffix(" (you)").removeSuffix(" (host)")
+                    val clean = n.replace(" (you)", "").replace(" (host)", "")
+                    val isYou = n.contains(" (you)")
                     val isHostRow = n.endsWith(" (host)")
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         // tap a name to see that person's profile
                         Row(Modifier.weight(1f).clickable { profileFor = n }.padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                             Avatar(clean, 30.dp)
                             Spacer(Modifier.width(8.dp))
-                            Text(if (isHostRow) "\uD83D\uDC51 $n" else n)
+                            Text(if (isHostRow) "\uD83D\uDC51 " + n.replace(" (you) (host)", " (host, you)") else n)
                         }
                         // the host can send a gift to a viewer (a different set from the gifts viewers send to the host)
-                        if (onGift != null && !n.endsWith("(you)") && !isHostRow) {
+                        if (onGift != null && !isYou && !isHostRow) {
                             TextButton({ giftFor = if (giftFor == n) "" else n }) { Text("\uD83C\uDF81") }
                         }
                         // guests have no profile, so they cannot be followed
-                        if (Api.auth.isNotEmpty() && !n.endsWith("(you)") && !isGuestAccount(clean)) {
+                        if (Api.auth.isNotEmpty() && !isYou && !isGuestAccount(clean)) {
                             TextButton({ Follows.toggle(fctx, clean); tick++ }) {
                                 Text(if (tick >= 0 && Follows.has(fctx, clean)) "Following \u2713" else "+ Follow")
                             }
@@ -807,6 +813,78 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
         }
     )
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = isMe && Api.auth.isNotEmpty(), onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
+}
+
+// My profile page: numbers, posts, and the buttons to post or edit the profile
+@Composable
+fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -> Unit, onPosts: () -> Unit, onBack: () -> Unit) {
+    val fctx = LocalContext.current
+    val sp = remember { fctx.getSharedPreferences("s", 0) }
+    var showAcct by remember { mutableStateOf(false) }
+    var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
+    val info by produceState<Api.ProfileInfo?>(null, user) {
+        value = withContext(Dispatchers.IO) {
+            Api.syncFollows(Api.serverUrl, Follows.list(fctx))
+            Api.profile(Api.serverUrl, user)
+        }
+    }
+    val cover by produceState<ImageBitmap?>(null, user) {
+        value = withContext(Dispatchers.IO) {
+            Api.fetchBytes(Api.serverUrl, "cover?u=" + java.net.URLEncoder.encode(user, "UTF-8"))?.let {
+                BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap()
+            }
+        }
+    }
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize().statusBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onBack) { Text("← Back") }
+            Spacer(Modifier.weight(1f))
+            TextButton({ showAcct = true }) { Text("⚙ Edit profile / Log out") }
+        }
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Avatar(user, 96.dp)
+            Text(user, style = MaterialTheme.typography.titleLarge)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            StatBox("Received", info?.received?.toString() ?: "-")
+            StatBox("Spent", info?.spent?.toString() ?: "-")
+            StatBox("Followers", info?.followers?.toString() ?: "-")
+            StatBox("Following", info?.following?.toString() ?: "-")
+        }
+        cover?.let {
+            Text("Live cover", style = MaterialTheme.typography.bodySmall)
+            Image(it, null, Modifier.size(140.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
+        }
+        Button(onPosts, Modifier.fillMaxWidth()) { Text("➕ New post (text, photo or video)") }
+        val posts = info?.posts.orEmpty()
+        Text(if (info == null) "Loading..." else if (posts.isEmpty()) "No posts yet" else "My posts", style = MaterialTheme.typography.titleSmall)
+        posts.chunked(3).forEach { rowPosts ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                rowPosts.forEach { p ->
+                    val th by produceState<ImageBitmap?>(null, p.id) {
+                        value = if (p.kind == "text") null else withContext(Dispatchers.IO) {
+                            Api.fetchBytes(Api.serverUrl, "post/" + p.id + "/thumb")?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
+                        }
+                    }
+                    Box(Modifier.weight(1f).aspectRatio(1f).clip(RoundedCornerShape(8.dp)).background(Color(0x22888888)).clickable { viewingPost = p }) {
+                        if (p.kind == "text") Text(p.caption, fontSize = 11.sp, maxLines = 6, modifier = Modifier.padding(5.dp))
+                        th?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
+                        if (p.kind == "video") Text("\u25B6", color = Color.White, modifier = Modifier.align(Alignment.Center))
+                    }
+                }
+                repeat(3 - rowPosts.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+    if (showAcct) AccountDialog(server, user, { token, name ->
+        Api.auth = token
+        sp.edit().putString("auth", token).putString("acct", name).apply()
+        onSettings(server, if (name.isNotEmpty()) name else makeGuestName(sp))
+        showAcct = false
+        if (name.isEmpty()) onBack() // logged out: nothing to show
+    }, { showAcct = false; onPosts() }) { showAcct = false }
+    viewingPost?.let { PostViewer(Api.serverUrl, it, mine = true, onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
 }
 
 @Composable
@@ -962,7 +1040,7 @@ fun makeGuestName(sp: android.content.SharedPreferences): String {
 @Composable
 fun HomeScreen(
     server: String, user: String, onSettings: (String, String) -> Unit,
-    onOpen: (Api.Stream) -> Unit, onGoLive: () -> Unit, onPosts: () -> Unit
+    onOpen: (Api.Stream) -> Unit, onGoLive: () -> Unit, onPosts: () -> Unit, onProfile: () -> Unit
 ) {
     var streams by remember { mutableStateOf(listOf<Api.Stream>()) }
     var err by remember { mutableStateOf("") }
@@ -1028,7 +1106,7 @@ fun HomeScreen(
         Button({ if (acct.isEmpty()) showAcct = true else onGoLive() }, Modifier.fillMaxWidth(), enabled = server.isNotBlank()) {
             Text(if (acct.isEmpty()) "Log in to Go Live" else "Go Live")
         }
-        OutlinedButton({ showAcct = true }, Modifier.fillMaxWidth()) { Text(if (acct.isEmpty()) "👤 Log in" else "👤 My profile") }
+        OutlinedButton({ if (acct.isEmpty()) showAcct = true else onProfile() }, Modifier.fillMaxWidth()) { Text(if (acct.isEmpty()) "👤 Log in" else "👤 My profile") }
         if (showTheme) ThemeDialog(hsp) { showTheme = false }
         if (showAcct) AccountDialog(server, acct, { token, name ->
             Api.auth = token
@@ -1627,7 +1705,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 for (r in listOf("auto", "9:16", "16:9", "1:1")) SideBtn(if (r == "auto") "Auto" else r, ratio == r) { ratio = r }
             }
         }
-        if (showViewers) ViewerListDialog(remember(viewers, showViewers) { viewerNames(lk) }, onGift = { to, g ->
+        if (showViewers) ViewerListDialog(remember(viewers, showViewers) { listOf("$user (you) (host)") + viewerNames(lk) }, onGift = { to, g ->
             msgs.addCapped("You sent $g to $to")
             fx.add(g, user)
             scope.launch { lk.send(JSONObject().put("t", "hgift").put("g", g).put("to", to)) }
