@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b123-restrict"
+const val BUILD_TAG = "b131-noemoji"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -777,8 +777,8 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
                     val nowFollowing = tick >= 0 && Follows.has(fctx, name)
                     val adj = (if (nowFollowing) 1 else 0) - (if (following0) 1 else 0)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        StatBox("Received", info?.received?.let { compactNum(it) } ?: "-")
-                        StatBox("Spent", info?.spent?.let { compactNum(it) } ?: "-")
+                        StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-")
+                        StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-")
                         StatBox("Followers", info?.let { compactNum((it.followers + adj).coerceAtLeast(0).toLong()) } ?: "-")
                         StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
                     }
@@ -823,6 +823,10 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
     val sp = remember { fctx.getSharedPreferences("s", 0) }
     var showAcct by remember { mutableStateOf(false) }
     var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
+    var showBuy by remember { mutableStateOf(false) }
+    var wallet by remember { mutableStateOf<Api.Wallet?>(null) } // my own balances (never shown on other people's profiles)
+    LaunchedEffect(user, showBuy) { wallet = withContext(Dispatchers.IO) { Api.walletInfo(server) } }
+    if (showBuy) BuyDialog(server, wallet?.diamonds ?: -1, { d -> wallet = Api.Wallet(wallet?.lumis ?: 0, d) }) { showBuy = false }
     val info by produceState<Api.ProfileInfo?>(null, user) {
         value = withContext(Dispatchers.IO) {
             Api.syncFollows(Api.serverUrl, Follows.list(fctx))
@@ -841,11 +845,14 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             Text(user, style = MaterialTheme.typography.titleLarge)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            StatBox("Received", info?.received?.let { compactNum(it) } ?: "-")
-            StatBox("Spent", info?.spent?.let { compactNum(it) } ?: "-")
+            StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-")
+            StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-")
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
             StatBox("Followers", info?.followers?.let { compactNum(it.toLong()) } ?: "-")
             StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
         }
+        OutlinedButton({ showBuy = true }, Modifier.fillMaxWidth()) { Text("💎 Buy diamonds") }
         Button(onPosts, Modifier.fillMaxWidth()) { Text("➕ Add post") }
         val posts = info?.posts.orEmpty()
         Text(if (info == null) "Loading..." else if (posts.isEmpty()) "No posts yet" else "My posts", style = MaterialTheme.typography.titleSmall)
@@ -875,6 +882,48 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
         if (name.isEmpty()) onBack() // logged out: nothing to show
     }, { showAcct = false; onPosts() }) { showAcct = false }
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = true, onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
+}
+
+// $ price of each diamond pack ($5 = 50 diamonds)
+val DIAMOND_PACKS = listOf(50 to 5, 100 to 10, 200 to 20, 500 to 50, 1000 to 100, 5000 to 500)
+
+@Composable
+fun BuyDialog(server: String, diamonds: Int, onBalance: (Int) -> Unit, onClose: () -> Unit) {
+    val bctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var msg by remember { mutableStateOf("") }
+    // while this is open the balance is checked every 3 seconds, so it updates after paying in the browser
+    LaunchedEffect(Unit) {
+        while (true) {
+            withContext(Dispatchers.IO) { Api.walletInfo(server) }?.let { onBalance(it.diamonds) }
+            delay(3000)
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Buy diamonds") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("You have 💎 " + (if (diamonds >= 0) diamonds.toString() else "…"))
+                DIAMOND_PACKS.forEach { (n, usd) ->
+                    Button({
+                        msg = ""
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) { Api.buy(server, n) }
+                            val url = r.first
+                            if (url != null) {
+                                try { bctx.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))) }
+                                catch (e: Exception) { msg = "Could not open the payment page" }
+                            } else msg = r.second
+                        }
+                    }, Modifier.fillMaxWidth()) { Text("💎 $n   –   US$" + usd) }
+                }
+                if (msg.isNotEmpty()) Text(msg, color = Color(0xFFFF8A80))
+                Text("Pay on the Stripe page, then come back here. Your diamonds appear within a few seconds.", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = { TextButton(onClose) { Text("Close") } }
+    )
 }
 
 // 1234 -> 1.2k, 1500000 -> 1.5M (cut, not rounded up)
@@ -1049,13 +1098,16 @@ fun HomeScreen(
     var err by remember { mutableStateOf("") }
     var showDiag by remember { mutableStateOf(false) }
     var showAcct by remember { mutableStateOf(false) }
-    var lumis by remember { mutableIntStateOf(-1) } // balance of the logged-in account
+    var lumis by remember { mutableIntStateOf(-1) } // lumis earned as a host
+    var diamondsBal by remember { mutableIntStateOf(-1) } // diamonds bought
     var showTheme by remember { mutableStateOf(false) }
     val hctx = LocalContext.current
     val hsp = remember { hctx.getSharedPreferences("s", 0) }
     var acct by remember { mutableStateOf(hsp.getString("acct", "") ?: "") }
     LaunchedEffect(acct, server) {
-        lumis = if (acct.isNotEmpty() && server.isNotBlank()) withContext(Dispatchers.IO) { Api.wallet(server) } else -1
+        val w = if (acct.isNotEmpty() && server.isNotBlank()) withContext(Dispatchers.IO) { Api.walletInfo(server) } else null
+        lumis = w?.lumis ?: -1
+        diamondsBal = w?.diamonds ?: -1
     }
     val sorted = remember(streams) {
         streams.sortedWith(compareByDescending<Api.Stream> { Follows.has(hctx, it.host) }.thenByDescending { it.same }.thenByDescending { Pref.score(hctx, it.type) }.thenByDescending { it.viewers })
@@ -1082,7 +1134,7 @@ fun HomeScreen(
                 if (alertsOn && !notifAllowed(alertCtx) && android.os.Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
             }) { Text(if (alertsOn) "🔔" else "🔕") }
             TextButton({ showTheme = true }) { Text("🎨") }
-            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct" + (if (lumis >= 0) " 💎$lumis" else "")) }
+            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct" + (if (lumis >= 0) " 💎${compactNum(diamondsBal.toLong())} ⭐${compactNum(lumis.toLong())}" else "")) }
             TextButton({ showDiag = true }) { Text("ⓘ") }
         }
         if (DEFAULT_SERVER.isBlank()) OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
@@ -1316,11 +1368,20 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
             if (Api.auth.isNotEmpty()) {
                 var showGifts by remember { mutableStateOf(false) }
                 var sel by remember { mutableStateOf(VIEWER_GIFTS.first().first) }
+                var diamonds by remember { mutableIntStateOf(-1) } // balance of the logged-in account
+                var showBuy by remember { mutableStateOf(false) }
+                var giftMsg by remember { mutableStateOf("") }
+                LaunchedEffect(showGifts) { if (showGifts) withContext(Dispatchers.IO) { Api.walletInfo(server) }?.let { diamonds = it.diamonds } }
+                if (showBuy) BuyDialog(server, diamonds, { diamonds = it }) { showBuy = false }
                 Row(Modifier.padding(horizontal = 12.dp)) {
                     FilledTonalButton({ showGifts = !showGifts }, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) { Text(if (showGifts) "✕" else "🎁 Gift") }
                 }
                 if (showGifts) Surface(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), shape = RoundedCornerShape(16.dp), color = Color(0xF0101018)) {
                     Column(Modifier.padding(8.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("💎 " + (if (diamonds >= 0) compactNum(diamonds.toLong()) else "…"), color = Color.White, modifier = Modifier.weight(1f))
+                            TextButton({ showBuy = true }) { Text("+ Buy diamonds") }
+                        }
                         LazyVerticalGrid(GridCells.Fixed(4), Modifier.height(250.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             items(VIEWER_GIFTS) { item ->
                                 val g = item.first
@@ -1328,22 +1389,32 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                                 Column(Modifier.fillMaxWidth().background(if (sel == g) Color(0x55FFFFFF) else Color(0x14FFFFFF), RoundedCornerShape(12.dp))
                                     .clickable { sel = g }.padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                                     Text(g, fontSize = 28.sp)
-                                    Text("$gv", fontSize = 12.sp, color = Color(0xFFFFD54F))
+                                    Text("💎$gv", fontSize = 12.sp, color = Color(0xFFFFD54F))
                                 }
                             }
                         }
                         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("$sel  ${lumisValue(sel)} lumis", color = Color.White)
+                            Text("$sel  💎${lumisValue(sel)}", color = Color.White)
                             Button({
                                 val g = sel
-                                msgs.addCapped("$user sent $g")
-                                fx.add(g, user)
+                                giftMsg = ""
                                 scope.launch {
-                                    lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side))
-                                    withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
+                                    // the gift is paid first; only a paid gift is shown and sent to the room
+                                    val r = withContext(Dispatchers.IO) { Api.sendGift(server, stream.id, g) }
+                                    if (r.ok) {
+                                        if (r.diamonds >= 0) diamonds = r.diamonds
+                                        msgs.addCapped("$user sent $g")
+                                        fx.add(g, user)
+                                        try { lk.send(JSONObject().put("t", "gift").put("g", g).put("s", side)) } catch (e: Exception) {}
+                                    } else {
+                                        if (r.diamonds >= 0) diamonds = r.diamonds
+                                        giftMsg = r.error
+                                        if (r.needDiamonds) showBuy = true
+                                    }
                                 }
                             }) { Text("Send") }
                         }
+                        if (giftMsg.isNotEmpty()) Text(giftMsg, color = Color(0xFFFF8A80), fontSize = 12.sp)
                     }
                 }
             }
@@ -1712,7 +1783,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         Column(Modifier.align(Alignment.TopStart).fillMaxWidth().statusBarsPadding().padding(12.dp)
             .graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) },
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("$status${if (recorder != null) " • ⏺ %d:%02d".format(recSecs / 60, recSecs % 60) else ""}${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers${if (lumis > 0) " • 💎 $lumis" else ""}", color = Color.White,
+            Text("$status${if (recorder != null) " • ⏺ %d:%02d".format(recSecs / 60, recSecs % 60) else ""}${if (muted) " • 🔇 muted" else ""}${if (sharing) " • 🖥 sharing" else ""} • 👁 $viewers${if (lumis > 0) " • ⭐ $lumis" else ""}", color = Color.White,
                 modifier = Modifier.clickable { showViewers = true }
                     .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(8.dp, 4.dp))
             if (pkActive) PkBoard(scoreL, scoreR, pkLeft, user, guestName, Modifier.fillMaxWidth())

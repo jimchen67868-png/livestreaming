@@ -119,6 +119,16 @@ const json = (o, status = 200) =>
 
 // ---------- accounts: email + password + emailed code (needs KV namespace bound as DB, and BREVO_KEY + MAIL_FROM) ----------
 // lumis the host earns per gift (emoji without the variation selector)
+// ---------- diamonds: bought with Stripe, spent on gifts; the host earns lumis ----------
+// A gift costs its number in diamonds (GIFT_LUMIS below is that price). The host earns LUMIS_PER_DIAMOND lumis for each diamond.
+const LUMIS_PER_DIAMOND = 1;
+// diamonds -> price in US cents ($5 = 50 diamonds, the smallest pack)
+const PACKS = { 50: 500, 100: 1000, 200: 2000, 500: 5000, 1000: 10000, 5000: 50000 };
+async function hmacHex(secret, msg) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
+  return [...sig].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
 const GIFT_LUMIS = { '🎇': 3000, '🐘': 50, '🐱': 40, '🎻': 1000, '🍦': 15, '🧸': 20, '🎠': 15, '💋': 700, '🎡': 30, '🦄': 2000, '🗼': 2000, '🚗': 100, '🎆': 3000, '🌌': 3, '🚕': 150, '🎀': 700, '🎹': 20000, '🍔': 5, '🎧': 80, '🍷': 40, '💍': 200, '🍫': 10, '🦅': 30000, '🍩': 20, '🚢': 2, '🏰': 20000, '🗽': 1500, '🍓': 3, '🌹': 1, '🛸': 8, '🎤': 1000, '📸': 5, '🌷': 100, '🌙': 30, '🌃': 5000, '🎪': 50, '🌈': 1, '🍾': 2, '🔔': 1500, '🐉': 10000, '🏠': 200, '🎈': 50, '🍟': 10000, '🦁': 5, '🚁': 20, '🎂': 5000, '👑': 60, '🚒': 500, '🌅': 30, '🍰': 2, '🌠': 150, '🎮': 10, '🦋': 300, '❤': 10, '🌋': 300, '🍕': 80, '🐶': 3000, '🎸': 60, '🍪': 8, '🚀': 40, '🚤': 100, '☕': 200, '🍀': 15, '🎨': 8, '🌉': 1000, '🚅': 500, '⛴': 30000 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -246,7 +256,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b123', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b126', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -260,6 +270,10 @@ export default {
         if (!r) return json({ error: 'no room' }, 404);
         const host = String(parseMeta(r).host || '');
         if (!host || host.toLowerCase() === viewer.toLowerCase()) return json({ error: 'cannot gift this room' }, 400);
+        // the gift is paid with diamonds
+        const dk = 'dm:' + viewer.toLowerCase();
+        const bal = parseInt(await env.DB.get(dk), 10) || 0;
+        if (bal < val) return json({ error: 'Not enough diamonds (this gift costs ' + val + ')', needDiamonds: true, diamonds: bal }, 402);
         // at most 500 gifts per viewer per day
         const ck = 'gc:' + viewer.toLowerCase();
         const c = (await env.DB.get(ck, 'json')) || { n: 0, exp: Date.now() + 86400000 };
@@ -267,16 +281,74 @@ export default {
         c.n++;
         await env.DB.put(ck, JSON.stringify(c), { expirationTtl: Math.max(60, Math.ceil((c.exp - Date.now()) / 1000)) });
         const lk = 'l:' + host.toLowerCase();
-        const total = (parseInt(await env.DB.get(lk), 10) || 0) + val;
+        await env.DB.put(dk, String(bal - val));
+        const total = (parseInt(await env.DB.get(lk), 10) || 0) + val * LUMIS_PER_DIAMOND;
         await env.DB.put(lk, String(total));
         const sk = 'sp:' + viewer.toLowerCase(); // total lumis this account has spent on gifts
         await env.DB.put(sk, String((parseInt(await env.DB.get(sk), 10) || 0) + val));
-        return json({ ok: true, lumis: val });
+        return json({ ok: true, lumis: val * LUMIS_PER_DIAMOND, diamonds: bal - val });
+      }
+      // ---------- Stripe: buy diamonds ----------
+      if (req.method === 'POST' && u.pathname === '/buy') {
+        if (!env.DB || !env.STRIPE_KEY) return json({ error: 'Payments are not set up yet' }, 503);
+        const a = await userOf(req, env);
+        if (!a) return json({ error: 'Log in to buy diamonds' }, 401);
+        const b = await req.json();
+        const n = parseInt(b.diamonds, 10);
+        const cents = PACKS[n];
+        if (!cents) return json({ error: 'unknown pack' }, 400);
+        const f = new URLSearchParams();
+        f.set('mode', 'payment');
+        f.set('success_url', u.origin + '/paid');
+        f.set('cancel_url', u.origin + '/paid?cancel=1');
+        f.set('client_reference_id', a);
+        f.set('line_items[0][quantity]', '1');
+        f.set('line_items[0][price_data][currency]', 'usd');
+        f.set('line_items[0][price_data][unit_amount]', String(cents));
+        f.set('line_items[0][price_data][product_data][name]', n + ' diamonds');
+        f.set('metadata[user]', a);
+        f.set('metadata[diamonds]', String(n));
+        const r = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + env.STRIPE_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: f,
+        });
+        const d = await r.json();
+        if (!r.ok || !d.url) return json({ error: (d.error && d.error.message) || 'Payment service error' }, 502);
+        return json({ url: d.url });
+      }
+      // the page Stripe sends the buyer back to
+      if (req.method === 'GET' && u.pathname === '/paid') {
+        const cancelled = u.searchParams.get('cancel');
+        return new Response('<meta name=viewport content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;text-align:center;padding:48px 20px"><h2>' +
+          (cancelled ? 'Payment cancelled' : 'Thank you!') + '</h2><p>' +
+          (cancelled ? 'Nothing was charged.' : 'Your diamonds appear in the app within a few seconds.') + '</p><p>You can close this page and go back to the app.</p>',
+          { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+      // Stripe tells us the payment went through (signed): the diamonds are added here, once per payment
+      if (req.method === 'POST' && u.pathname === '/stripe-webhook') {
+        if (!env.DB || !env.STRIPE_WH) return new Response('not set up', { status: 503 });
+        const raw = await req.text();
+        const parts = Object.fromEntries(String(req.headers.get('Stripe-Signature') || '').split(',').map((x) => x.split('=')));
+        const ts = parseInt(parts.t, 10);
+        if (!ts || Math.abs(Date.now() / 1000 - ts) > 300 || (await hmacHex(env.STRIPE_WH, ts + '.' + raw)) !== parts.v1) return new Response('bad signature', { status: 400 });
+        const ev = JSON.parse(raw);
+        const s = ev.data && ev.data.object;
+        if (ev.type === 'checkout.session.completed' && s && s.payment_status === 'paid') {
+          const n = parseInt((s.metadata || {}).diamonds, 10);
+          const who = String((s.metadata || {}).user || '').toLowerCase();
+          if (who && PACKS[n] === s.amount_total && !(await env.DB.get('sx:' + s.id))) {
+            await env.DB.put('sx:' + s.id, '1', { expirationTtl: 90 * 86400 });
+            const k = 'dm:' + who;
+            await env.DB.put(k, String((parseInt(await env.DB.get(k), 10) || 0) + n));
+          }
+        }
+        return new Response('ok');
       }
       if (req.method === 'GET' && u.pathname === '/wallet') {
         const a = await userOf(req, env);
         if (!a) return json({ error: 'not logged in' }, 401);
-        return json({ lumis: parseInt(await env.DB.get('l:' + a.toLowerCase()), 10) || 0 });
+        return json({ lumis: parseInt(await env.DB.get('l:' + a.toLowerCase()), 10) || 0, diamonds: parseInt(await env.DB.get('dm:' + a.toLowerCase()), 10) || 0 });
       }
       // Profile photos (small JPEG, base64) kept in KV per account
       if (req.method === 'POST' && u.pathname === '/avatar') {

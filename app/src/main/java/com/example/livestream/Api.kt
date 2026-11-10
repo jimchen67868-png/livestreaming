@@ -28,13 +28,34 @@ object Api {
             try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject().put("error", "Server error " + r.code) }
         }
 
-    /** Tells the server a gift was sent, so the host earns lumis. Failures are ignored (the gift itself still shows). */
-    fun sendGift(server: String, room: String, g: String) {
-        try {
-            val body = JSONObject().put("room", room).put("g", g).toString().toRequestBody("application/json".toMediaType())
-            http.newCall(Request.Builder().url("${base(server)}/gift").header("X-Auth", auth).post(body).build()).execute().close()
-        } catch (e: Exception) {}
-    }
+    data class GiftResult(val ok: Boolean, val diamonds: Int, val error: String, val needDiamonds: Boolean)
+
+    /** Pays a gift with diamonds. ok = paid (the host earns lumis); otherwise error says why. */
+    fun sendGift(server: String, room: String, g: String): GiftResult = try {
+        val body = JSONObject().put("room", room).put("g", g).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/gift").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            val o = try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject() }
+            if (r.isSuccessful) GiftResult(true, o.optInt("diamonds", -1), "", false)
+            else GiftResult(false, o.optInt("diamonds", -1), o.optString("error", "Gift failed"), o.optBoolean("needDiamonds"))
+        }
+    } catch (e: Exception) { GiftResult(false, -1, "No connection", false) }
+
+    data class Wallet(val lumis: Int, val diamonds: Int)
+
+    fun walletInfo(server: String): Wallet? = try {
+        http.newCall(Request.Builder().url("${base(server)}/wallet").header("X-Auth", auth).build()).execute().use { r ->
+            if (!r.isSuccessful) null else JSONObject(r.body!!.string()).let { Wallet(it.optInt("lumis", 0), it.optInt("diamonds", 0)) }
+        }
+    } catch (e: Exception) { null }
+
+    /** Starts a Stripe checkout for a diamond pack: returns (payment page url, "") or (null, error). */
+    fun buy(server: String, diamonds: Int): Pair<String?, String> = try {
+        val body = JSONObject().put("diamonds", diamonds).toString().toRequestBody("application/json".toMediaType())
+        http.newCall(Request.Builder().url("${base(server)}/buy").header("X-Auth", auth).post(body).build()).execute().use { r ->
+            val o = try { JSONObject(r.body!!.string()) } catch (e: Exception) { JSONObject() }
+            if (r.isSuccessful && o.optString("url").isNotEmpty()) Pair(o.getString("url"), "") else Pair(null, o.optString("error", "Could not start the payment"))
+        }
+    } catch (e: Exception) { Pair(null, "No connection") }
 
     /** Lumis balance of the logged-in account, or -1 if it cannot be read. */
     fun wallet(server: String): Int = try {
