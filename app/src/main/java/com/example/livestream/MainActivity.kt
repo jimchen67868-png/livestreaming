@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b133-min050usd"
+const val BUILD_TAG = "b134-diamondbalance"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -852,7 +852,9 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             StatBox("Followers", info?.followers?.let { compactNum(it.toLong()) } ?: "-")
             StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
         }
-        OutlinedButton({ showBuy = true }, Modifier.fillMaxWidth()) { Text("💎 Buy diamonds") }
+        // my diamond balance (what I can still spend on gifts)
+        Text("My diamonds: " + (wallet?.diamonds?.toString() ?: "…"), style = MaterialTheme.typography.titleMedium, modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Button({ showBuy = true }, Modifier.fillMaxWidth()) { Text("Buy diamonds") }
         Button(onPosts, Modifier.fillMaxWidth()) { Text("➕ Add post") }
         val posts = info?.posts.orEmpty()
         Text(if (info == null) "Loading..." else if (posts.isEmpty()) "No posts yet" else "My posts", style = MaterialTheme.typography.titleSmall)
