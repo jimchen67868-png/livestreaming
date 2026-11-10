@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b136-homeheader"
+const val BUILD_TAG = "b137-livebutton"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1872,8 +1872,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 msgs.addCapped("$user (broadcaster): $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
-            Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button({ if (live) stop() else goLive() }, Modifier.weight(1f), enabled = live || countdown == 0) { Text(if (live) "End" else if (countdown > 0) "Starting…" else "Go Live") }
+            // Go Live / End has its own full-width row so it is always visible; the other buttons scroll sideways on a narrow phone
+            Button({ if (live) stop() else goLive() }, Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 12.dp), enabled = live || countdown == 0) { Text(if (live) "End" else if (countdown > 0) "Starting…" else "Go Live") }
+            Row(Modifier.horizontalScroll(rememberScrollState()).padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton({
                     scope.launch {
                         try { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
