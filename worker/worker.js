@@ -129,6 +129,34 @@ async function hmacHex(secret, msg) {
   const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
   return [...sig].map((x) => x.toString(16).padStart(2, '0')).join('');
 }
+// adds the diamonds of one paid Checkout Session, once only (the webhook and the claim below can both call this)
+async function creditSession(env, s) {
+  if (!s || s.payment_status !== 'paid') return 0;
+  const n = parseInt((s.metadata || {}).diamonds, 10);
+  const who = String((s.metadata || {}).user || '').toLowerCase();
+  if (!who || PACKS[n] !== s.amount_total || (await env.DB.get('sx:' + s.id))) return 0;
+  await env.DB.put('sx:' + s.id, '1', { expirationTtl: 90 * 86400 });
+  const k = 'dm:' + who;
+  await env.DB.put(k, String((parseInt(await env.DB.get(k), 10) || 0) + n));
+  return n;
+}
+// does not depend on the webhook: asks Stripe about the checkouts this account started in the last 35 minutes
+async function claimPending(env, name) {
+  if (!env.DB || !env.STRIPE_KEY || !name) return;
+  const pk = 'ps:' + name.toLowerCase();
+  const list = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 35 * 60000);
+  if (!list.length) return;
+  const keep = [];
+  for (const x of list) {
+    try {
+      const r = await fetch('https://api.stripe.com/v1/checkout/sessions/' + encodeURIComponent(x.id), { headers: { Authorization: 'Bearer ' + env.STRIPE_KEY } });
+      const s = await r.json();
+      if (s.payment_status === 'paid') await creditSession(env, s);
+      else if (s.status === 'open') keep.push(x);
+    } catch (e) { keep.push(x); }
+  }
+  await env.DB.put(pk, JSON.stringify(keep), { expirationTtl: 3600 });
+}
 const GIFT_LUMIS = { '🎇': 3000, '🐘': 50, '🐱': 40, '🎻': 1000, '🍦': 15, '🧸': 20, '🎠': 15, '💋': 700, '🎡': 30, '🦄': 2000, '🗼': 2000, '🚗': 100, '🎆': 3000, '🌌': 3, '🚕': 150, '🎀': 700, '🎹': 20000, '🍔': 5, '🎧': 80, '🍷': 40, '💍': 200, '🍫': 10, '🦅': 30000, '🍩': 20, '🚢': 2, '🏰': 20000, '🗽': 1500, '🍓': 3, '🌹': 1, '🛸': 8, '🎤': 1000, '📸': 5, '🌷': 100, '🌙': 30, '🌃': 5000, '🎪': 50, '🌈': 1, '🍾': 2, '🔔': 1500, '🐉': 10000, '🏠': 200, '🎈': 50, '🍟': 10000, '🦁': 5, '🚁': 20, '🎂': 5000, '👑': 60, '🚒': 500, '🌅': 30, '🍰': 2, '🌠': 150, '🎮': 10, '🦋': 300, '❤': 10, '🌋': 300, '🍕': 80, '🐶': 3000, '🎸': 60, '🍪': 8, '🚀': 40, '🚤': 100, '☕': 200, '🍀': 15, '🎨': 8, '🌉': 1000, '🚅': 500, '⛴': 30000 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -256,7 +284,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b133', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b135', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -308,6 +336,7 @@ export default {
         f.set('line_items[0][price_data][product_data][name]', n + ' diamonds');
         f.set('metadata[user]', a);
         f.set('metadata[diamonds]', String(n));
+        f.set('expires_at', String(Math.floor(Date.now() / 1000) + 1800));
         const r = await fetch('https://api.stripe.com/v1/checkout/sessions', {
           method: 'POST',
           headers: { Authorization: 'Bearer ' + env.STRIPE_KEY, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -315,6 +344,10 @@ export default {
         });
         const d = await r.json();
         if (!r.ok || !d.url) return json({ error: (d.error && d.error.message) || 'Payment service error' }, 502);
+        const pk = 'ps:' + a.toLowerCase();
+        const pend = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 35 * 60000);
+        pend.push({ id: d.id, ts: Date.now() });
+        await env.DB.put(pk, JSON.stringify(pend.slice(-10)), { expirationTtl: 3600 });
         return json({ url: d.url });
       }
       // the page Stripe sends the buyer back to
@@ -334,20 +367,13 @@ export default {
         if (!ts || Math.abs(Date.now() / 1000 - ts) > 300 || (await hmacHex(env.STRIPE_WH, ts + '.' + raw)) !== parts.v1) return new Response('bad signature', { status: 400 });
         const ev = JSON.parse(raw);
         const s = ev.data && ev.data.object;
-        if (ev.type === 'checkout.session.completed' && s && s.payment_status === 'paid') {
-          const n = parseInt((s.metadata || {}).diamonds, 10);
-          const who = String((s.metadata || {}).user || '').toLowerCase();
-          if (who && PACKS[n] === s.amount_total && !(await env.DB.get('sx:' + s.id))) {
-            await env.DB.put('sx:' + s.id, '1', { expirationTtl: 90 * 86400 });
-            const k = 'dm:' + who;
-            await env.DB.put(k, String((parseInt(await env.DB.get(k), 10) || 0) + n));
-          }
-        }
+        if (ev.type === 'checkout.session.completed' && s) await creditSession(env, s);
         return new Response('ok');
       }
       if (req.method === 'GET' && u.pathname === '/wallet') {
         const a = await userOf(req, env);
         if (!a) return json({ error: 'not logged in' }, 401);
+        await claimPending(env, a); // adds diamonds for a payment even if the webhook did not arrive
         return json({ lumis: parseInt(await env.DB.get('l:' + a.toLowerCase()), 10) || 0, diamonds: parseInt(await env.DB.get('dm:' + a.toLowerCase()), 10) || 0 });
       }
       // Profile photos (small JPEG, base64) kept in KV per account
