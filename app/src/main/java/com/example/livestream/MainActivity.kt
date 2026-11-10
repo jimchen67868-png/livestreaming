@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b131-noemoji"
+const val BUILD_TAG = "b133-min050usd"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -884,8 +884,8 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = true, onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
 }
 
-// $ price of each diamond pack ($5 = 50 diamonds)
-val DIAMOND_PACKS = listOf(50 to 5, 100 to 10, 200 to 20, 500 to 50, 1000 to 100, 5000 to 500)
+// diamonds to price in US cents ($5 = 50 diamonds)
+val DIAMOND_PACKS = listOf(5 to 50, 10 to 100, 50 to 500, 100 to 1000, 200 to 2000, 500 to 5000, 1000 to 10000, 5000 to 50000)
 
 @Composable
 fun BuyDialog(server: String, diamonds: Int, onBalance: (Int) -> Unit, onClose: () -> Unit) {
@@ -905,7 +905,7 @@ fun BuyDialog(server: String, diamonds: Int, onBalance: (Int) -> Unit, onClose: 
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("You have 💎 " + (if (diamonds >= 0) diamonds.toString() else "…"))
-                DIAMOND_PACKS.forEach { (n, usd) ->
+                DIAMOND_PACKS.forEach { (n, cents) ->
                     Button({
                         msg = ""
                         scope.launch {
@@ -916,7 +916,7 @@ fun BuyDialog(server: String, diamonds: Int, onBalance: (Int) -> Unit, onClose: 
                                 catch (e: Exception) { msg = "Could not open the payment page" }
                             } else msg = r.second
                         }
-                    }, Modifier.fillMaxWidth()) { Text("💎 $n   –   US$" + usd) }
+                    }, Modifier.fillMaxWidth()) { Text("💎 $n   –   US$" + "%d.%02d".format(cents / 100, cents % 100)) }
                 }
                 if (msg.isNotEmpty()) Text(msg, color = Color(0xFFFF8A80))
                 Text("Pay on the Stripe page, then come back here. Your diamonds appear within a few seconds.", style = MaterialTheme.typography.bodySmall)

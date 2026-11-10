@@ -122,8 +122,8 @@ const json = (o, status = 200) =>
 // ---------- diamonds: bought with Stripe, spent on gifts; the host earns lumis ----------
 // A gift costs its number in diamonds (GIFT_LUMIS below is that price). The host earns LUMIS_PER_DIAMOND lumis for each diamond.
 const LUMIS_PER_DIAMOND = 1;
-// diamonds -> price in US cents ($5 = 50 diamonds, the smallest pack)
-const PACKS = { 50: 500, 100: 1000, 200: 2000, 500: 5000, 1000: 10000, 5000: 50000 };
+// diamonds -> price in US cents ($0.50 = 5 diamonds is the smallest pack: Stripe's own minimum, $5 = 50)
+const PACKS = { 5: 50, 10: 100, 50: 500, 100: 1000, 200: 2000, 500: 5000, 1000: 10000, 5000: 50000 };
 async function hmacHex(secret, msg) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
@@ -256,7 +256,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b126', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b133', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
