@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b135-claim"
+const val BUILD_TAG = "b136-homeheader"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1128,7 +1128,7 @@ fun HomeScreen(
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+            Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f), maxLines = 1, softWrap = false)
             // alert when someone you follow goes live (checked about every 15 minutes in the background)
             TextButton({
                 alertsOn = !alertsOn
@@ -1136,12 +1136,12 @@ fun HomeScreen(
                 if (alertsOn && !notifAllowed(alertCtx) && android.os.Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
             }) { Text(if (alertsOn) "🔔" else "🔕") }
             TextButton({ showTheme = true }) { Text("🎨") }
-            TextButton({ showAcct = true }) { Text(if (acct.isEmpty()) "👤" else "👤 $acct" + (if (lumis >= 0) " 💎${compactNum(diamondsBal.toLong())} ⭐${compactNum(lumis.toLong())}" else "")) }
+            TextButton({ showAcct = true }) { Text("👤") }
             TextButton({ showDiag = true }) { Text("ⓘ") }
         }
         if (DEFAULT_SERVER.isBlank()) OutlinedTextField(server, { onSettings(it.trim(), user) }, label = { Text("Server URL (your Worker)") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
-        Text(if (acct.isEmpty()) "You are $user (guest)" else "You are $user", style = MaterialTheme.typography.bodySmall)
+        Text(if (acct.isEmpty()) "You are $user (guest)" else "You are $user" + (if (lumis >= 0) "   •   Diamonds ${compactNum(diamondsBal.toLong())}   •   Lumis ${compactNum(lumis.toLong())}" else ""), style = MaterialTheme.typography.bodySmall)
         if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
         LazyVerticalGrid(GridCells.Fixed(2), Modifier.weight(1f),
             horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
