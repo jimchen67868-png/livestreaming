@@ -140,11 +140,11 @@ async function creditSession(env, s) {
   await env.DB.put(k, String((parseInt(await env.DB.get(k), 10) || 0) + n));
   return n;
 }
-// does not depend on the webhook: asks Stripe about the checkouts this account started in the last 35 minutes
+// does not depend on the webhook: asks Stripe about the checkouts this account started in the last 2 days
 async function claimPending(env, name) {
   if (!env.DB || !env.STRIPE_KEY || !name) return;
   const pk = 'ps:' + name.toLowerCase();
-  const list = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 35 * 60000);
+  const list = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 2 * 86400000);
   if (!list.length) return;
   const keep = [];
   for (const x of list) {
@@ -155,7 +155,19 @@ async function claimPending(env, name) {
       else if (s.status === 'open') keep.push(x);
     } catch (e) { keep.push(x); }
   }
-  await env.DB.put(pk, JSON.stringify(keep), { expirationTtl: 3600 });
+  await env.DB.put(pk, JSON.stringify(keep), { expirationTtl: 259200 });
+}
+// fr:<name> = JSON list of the names that follow this account (the list behind the Followers number)
+async function frAdd(env, to, me) {
+  const l = (await env.DB.get('fr:' + to, 'json')) || [];
+  if (l.includes(me)) return false;
+  l.push(me);
+  await env.DB.put('fr:' + to, JSON.stringify(l.slice(-2000)));
+  return true;
+}
+async function frDel(env, to, me) {
+  const l = (await env.DB.get('fr:' + to, 'json')) || [];
+  if (l.includes(me)) await env.DB.put('fr:' + to, JSON.stringify(l.filter((x) => x !== me)));
 }
 const GIFT_LUMIS = { '🎇': 3000, '🐘': 50, '🐱': 40, '🎻': 1000, '🍦': 15, '🧸': 20, '🎠': 15, '💋': 700, '🎡': 30, '🦄': 2000, '🗼': 2000, '🚗': 100, '🎆': 3000, '🌌': 3, '🚕': 150, '🎀': 700, '🎹': 20000, '🍔': 5, '🎧': 80, '🍷': 40, '💍': 200, '🍫': 10, '🦅': 30000, '🍩': 20, '🚢': 2, '🏰': 20000, '🗽': 1500, '🍓': 3, '🌹': 1, '🛸': 8, '🎤': 1000, '📸': 5, '🌷': 100, '🌙': 30, '🌃': 5000, '🎪': 50, '🌈': 1, '🍾': 2, '🔔': 1500, '🐉': 10000, '🏠': 200, '🎈': 50, '🍟': 10000, '🦁': 5, '🚁': 20, '🎂': 5000, '👑': 60, '🚒': 500, '🌅': 30, '🍰': 2, '🌠': 150, '🎮': 10, '🦋': 300, '❤': 10, '🌋': 300, '🍕': 80, '🐶': 3000, '🎸': 60, '🍪': 8, '🚀': 40, '🚤': 100, '☕': 200, '🍀': 15, '🎨': 8, '🌉': 1000, '🚅': 500, '⛴': 30000 };
 const NAME_RE = /^[A-Za-z0-9_]{3,16}$/;
@@ -284,7 +296,7 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b135', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b141', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -314,6 +326,26 @@ export default {
         await env.DB.put(lk, String(total));
         const sk = 'sp:' + viewer.toLowerCase(); // total lumis this account has spent on gifts
         await env.DB.put(sk, String((parseInt(await env.DB.get(sk), 10) || 0) + val));
+        // lf:<host> = who sent this host lumis: { <lowercase name>: { n: display name, v: total lumis } }
+        try {
+          const fk = 'lf:' + host.toLowerCase();
+          const fm = (await env.DB.get(fk, 'json')) || {};
+          const vk = viewer.toLowerCase();
+          fm[vk] = { n: viewer, v: ((fm[vk] && fm[vk].v) || 0) + val * LUMIS_PER_DIAMOND };
+          const ks = Object.keys(fm);
+          if (ks.length > 300) { ks.sort((x, y) => fm[x].v - fm[y].v); for (const x of ks.slice(0, ks.length - 300)) delete fm[x]; }
+          await env.DB.put(fk, JSON.stringify(fm));
+        } catch (e) {}
+        // lt:<viewer> = who this account sent diamonds to: { <lowercase host>: { n: display name, v: total diamonds } }
+        try {
+          const tk = 'lt:' + viewer.toLowerCase();
+          const tm = (await env.DB.get(tk, 'json')) || {};
+          const hk = host.toLowerCase();
+          tm[hk] = { n: host, v: ((tm[hk] && tm[hk].v) || 0) + val };
+          const ts = Object.keys(tm);
+          if (ts.length > 300) { ts.sort((x, y) => tm[x].v - tm[y].v); for (const x of ts.slice(0, ts.length - 300)) delete tm[x]; }
+          await env.DB.put(tk, JSON.stringify(tm));
+        } catch (e) {}
         return json({ ok: true, lumis: val * LUMIS_PER_DIAMOND, diamonds: bal - val });
       }
       // ---------- Stripe: buy diamonds ----------
@@ -345,9 +377,9 @@ export default {
         const d = await r.json();
         if (!r.ok || !d.url) return json({ error: (d.error && d.error.message) || 'Payment service error' }, 502);
         const pk = 'ps:' + a.toLowerCase();
-        const pend = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 35 * 60000);
+        const pend = ((await env.DB.get(pk, 'json')) || []).filter((x) => Date.now() - x.ts < 2 * 86400000);
         pend.push({ id: d.id, ts: Date.now() });
-        await env.DB.put(pk, JSON.stringify(pend.slice(-10)), { expirationTtl: 3600 });
+        await env.DB.put(pk, JSON.stringify(pend.slice(-10)), { expirationTtl: 259200 });
         return json({ url: d.url });
       }
       // the page Stripe sends the buyer back to
@@ -612,7 +644,9 @@ export default {
           list.push(to);
           await env.DB.put('fg:' + mk, JSON.stringify(list));
           await env.DB.put('fn:' + to, String((parseInt(await env.DB.get('fn:' + to), 10) || 0) + 1));
+          await frAdd(env, to, mk);
         } else if (!b.on && has) {
+          await frDel(env, to, mk);
           await env.DB.put('fg:' + mk, JSON.stringify(list.filter((x) => x !== to)));
           await env.DB.put('fn:' + to, String(Math.max(0, (parseInt(await env.DB.get('fn:' + to), 10) || 0) - 1)));
         }
@@ -629,14 +663,43 @@ export default {
         let added = 0;
         for (const raw of (Array.isArray(b.names) ? b.names : []).slice(0, 100)) {
           const to = String(raw || '').toLowerCase().slice(0, 20);
-          if (!to || to === mk || list.includes(to) || list.length >= 500) continue;
+          if (to && to !== mk && list.includes(to)) { await frAdd(env, to, mk); continue; } // fills the Followers list for follows made before it existed
+          if (!to || to === mk || list.length >= 500) continue;
           if (!(await env.DB.get('u:' + to))) continue;
           list.push(to);
           added++;
           await env.DB.put('fn:' + to, String((parseInt(await env.DB.get('fn:' + to), 10) || 0) + 1));
+          await frAdd(env, to, mk);
         }
         if (added) await env.DB.put('fg:' + mk, JSON.stringify(list));
         return json({ ok: true, added });
+      }
+      // names behind the Followers / Following numbers: GET /people?u=<name>&t=followers|following
+      if (req.method === 'GET' && u.pathname === '/people') {
+        if (!env.DB) return json({ names: [] });
+        const nm = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20);
+        if (!nm) return json({ error: 'name?' }, 400);
+        const t = u.searchParams.get('t') === 'following' ? 'fg:' : 'fr:';
+        const names = ((await env.DB.get(t + nm, 'json')) || []).slice(-200).reverse();
+        return json({ names });
+      }
+      // who sent ME lumis, most first (only for the logged-in account)
+      if (req.method === 'GET' && u.pathname === '/lumis-from') {
+        if (!env.DB) return json({ from: [] });
+        const me = await userOf(req, env);
+        if (!me) return json({ error: 'Log in' }, 401);
+        const fm = (await env.DB.get('lf:' + me.toLowerCase(), 'json')) || {};
+        const from = Object.values(fm).sort((x, y) => y.v - x.v).slice(0, 100).map((x) => ({ name: x.n, lumis: x.v }));
+        return json({ from });
+      }
+      // who I sent diamonds to, most first (only for the logged-in account)
+      if (req.method === 'GET' && u.pathname === '/diamonds-to') {
+        if (!env.DB) return json({ to: [] });
+        const me = await userOf(req, env);
+        if (!me) return json({ error: 'Log in' }, 401);
+        const tm = (await env.DB.get('lt:' + me.toLowerCase(), 'json')) || {};
+        const to = Object.values(tm).sort((x, y) => y.v - x.v).slice(0, 100).map((x) => ({ name: x.n, diamonds: x.v }));
+        return json({ to });
       }
       // public profile numbers + that person's latest posts
       if (req.method === 'GET' && u.pathname === '/profile') {

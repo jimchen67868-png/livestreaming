@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b138-toolschat"
+const val BUILD_TAG = "b142-diamondsto"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -764,6 +764,7 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
         }
     }
     var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
+    var listKind by remember { mutableStateOf("") } // "", "followers" or "following"
     val following0 = remember(name) { Follows.has(fctx, name) } // state when the dialog opened (the server count already includes it)
     AlertDialog(
         onDismissRequest = onClose,
@@ -779,8 +780,8 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                         StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-")
                         StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-")
-                        StatBox("Followers", info?.let { compactNum((it.followers + adj).coerceAtLeast(0).toLong()) } ?: "-")
-                        StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
+                        StatBox("Followers", info?.let { compactNum((it.followers + adj).coerceAtLeast(0).toLong()) } ?: "-") { listKind = "followers" }
+                        StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-") { listKind = "following" }
                     }
                 }
                 cover?.let { Image(it, null, Modifier.size(140.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop) }
@@ -813,6 +814,7 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
             }
         }
     )
+    if (listKind.isNotEmpty()) PeopleDialog(if (listKind == "followers") "Followers" else "Following", "", { Api.people(Api.serverUrl, name, listKind)?.map { it to 0L } }) { listKind = "" }
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = isMe && Api.auth.isNotEmpty(), onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
 }
 
@@ -824,6 +826,7 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
     var showAcct by remember { mutableStateOf(false) }
     var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
     var showBuy by remember { mutableStateOf(false) }
+    var listKind by remember { mutableStateOf("") } // "", "followers", "following", "lumis" or "diamonds"
     var wallet by remember { mutableStateOf<Api.Wallet?>(null) } // my own balances (never shown on other people's profiles)
     LaunchedEffect(user, showBuy) { wallet = withContext(Dispatchers.IO) { Api.walletInfo(server) } }
     if (showBuy) BuyDialog(server, wallet?.diamonds ?: -1, { d -> wallet = Api.Wallet(wallet?.lumis ?: 0, d) }) { showBuy = false }
@@ -845,12 +848,12 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             Text(user, style = MaterialTheme.typography.titleLarge)
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-")
-            StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-")
+            StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-") { listKind = "lumis" }
+            StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-") { listKind = "diamonds" }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            StatBox("Followers", info?.followers?.let { compactNum(it.toLong()) } ?: "-")
-            StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-")
+            StatBox("Followers", info?.followers?.let { compactNum(it.toLong()) } ?: "-") { listKind = "followers" }
+            StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-") { listKind = "following" }
         }
         // my diamond balance (what I can still spend on gifts)
         Text("My diamonds: " + (wallet?.diamonds?.toString() ?: "…"), style = MaterialTheme.typography.titleMedium, modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
@@ -876,6 +879,9 @@ fun MyProfileScreen(server: String, user: String, onSettings: (String, String) -
             }
         }
     }
+    if (listKind == "lumis") PeopleDialog("Lumis from", "lumis", { Api.lumisFrom(server) }) { listKind = "" }
+    else if (listKind == "diamonds") PeopleDialog("Diamonds sent to", "diamonds", { Api.diamondsTo(server) }) { listKind = "" }
+    else if (listKind.isNotEmpty()) PeopleDialog(if (listKind == "followers") "Followers" else "Following", "", { Api.people(server, user, listKind)?.map { it to 0L } }) { listKind = "" }
     if (showAcct) AccountDialog(server, user, { token, name ->
         Api.auth = token
         sp.edit().putString("auth", token).putString("acct", name).apply()
@@ -941,9 +947,40 @@ fun compactNum(n: Long): String {
     }
 }
 
+// A list of people with an optional number on the right (followers, following, who sent me lumis)
 @Composable
-fun StatBox(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+fun PeopleDialog(title: String, unit: String, load: () -> List<Pair<String, Long>>?, onClose: () -> Unit) {
+    var loaded by remember { mutableStateOf(false) }
+    var rows by remember { mutableStateOf<List<Pair<String, Long>>?>(null) }
+    LaunchedEffect(Unit) { rows = withContext(Dispatchers.IO) { load() }; loaded = true }
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClose) { Text("Close") } },
+        title = { Text(title) },
+        text = {
+            val list = rows.orEmpty()
+            if (!loaded) Text("Loading...")
+            else if (rows == null) Text("Can't reach server")
+            else if (list.isEmpty()) Text("Nobody yet")
+            else LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                items(list.size) { i ->
+                    val (nm, n) = list[i]
+                    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (unit.isNotEmpty()) Text("${i + 1}", Modifier.width(28.dp), style = MaterialTheme.typography.bodySmall)
+                        Avatar(nm, 36.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(nm, Modifier.weight(1f), maxLines = 1)
+                        if (unit.isNotEmpty()) Text(compactNum(n) + " " + unit, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    )
+}
+
+@Composable
+fun StatBox(label: String, value: String, onClick: (() -> Unit)? = null) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = if (onClick != null) Modifier.clip(RoundedCornerShape(8.dp)).clickable { onClick() }.padding(horizontal = 8.dp, vertical = 4.dp) else Modifier) {
         Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         Text(label, style = MaterialTheme.typography.bodySmall)
     }

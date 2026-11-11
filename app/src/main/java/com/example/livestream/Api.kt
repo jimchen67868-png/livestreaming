@@ -113,6 +113,37 @@ object Api {
         }
     } catch (e: Exception) { null }
 
+    /** Names that follow [name] (kind "followers") or that [name] follows (kind "following"); null if the server can't be reached. */
+    fun people(server: String, name: String, kind: String): List<String>? = try {
+        val url = "${base(server)}/people?t=$kind&u=" + java.net.URLEncoder.encode(name, "UTF-8")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            if (!r.isSuccessful) null else {
+                val a = JSONObject(r.body!!.string()).optJSONArray("names") ?: JSONArray()
+                (0 until a.length()).map { a.getString(it) }
+            }
+        }
+    } catch (e: Exception) { null }
+
+    /** Who sent my account lumis, as name to total, most first; null if the server can't be reached. */
+    fun lumisFrom(server: String): List<Pair<String, Long>>? = try {
+        http.newCall(Request.Builder().url("${base(server)}/lumis-from").header("X-Auth", auth).build()).execute().use { r ->
+            if (!r.isSuccessful) null else {
+                val a = JSONObject(r.body!!.string()).optJSONArray("from") ?: JSONArray()
+                (0 until a.length()).map { a.getJSONObject(it).let { o -> o.optString("name") to o.optLong("lumis") } }
+            }
+        }
+    } catch (e: Exception) { null }
+
+    /** Who I sent diamonds to, as name to total, most first; null if the server can't be reached. */
+    fun diamondsTo(server: String): List<Pair<String, Long>>? = try {
+        http.newCall(Request.Builder().url("${base(server)}/diamonds-to").header("X-Auth", auth).build()).execute().use { r ->
+            if (!r.isSuccessful) null else {
+                val a = JSONObject(r.body!!.string()).optJSONArray("to") ?: JSONArray()
+                (0 until a.length()).map { a.getJSONObject(it).let { o -> o.optString("name") to o.optLong("diamonds") } }
+            }
+        }
+    } catch (e: Exception) { null }
+
     /** Tells the server about a follow / unfollow (fire and forget; the phone's own list still works without it). */
     fun followAsync(server: String, to: String, on: Boolean) {
         if (auth.isEmpty() || server.isBlank()) return
