@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b142-diamondsto"
+const val BUILD_TAG = "b145-trimrange"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -953,6 +953,10 @@ fun PeopleDialog(title: String, unit: String, load: () -> List<Pair<String, Long
     var loaded by remember { mutableStateOf(false) }
     var rows by remember { mutableStateOf<List<Pair<String, Long>>?>(null) }
     LaunchedEffect(Unit) { rows = withContext(Dispatchers.IO) { load() }; loaded = true }
+    val pctx = LocalContext.current
+    val myName = remember { pctx.getSharedPreferences("s", 0).getString("acct", "") ?: "" }
+    var tick by remember { mutableStateOf(0) }
+    var openName by remember { mutableStateOf("") } // the person whose profile is open on top of this list
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClose) { Text("Close") } },
@@ -965,17 +969,24 @@ fun PeopleDialog(title: String, unit: String, load: () -> List<Pair<String, Long
             else LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
                 items(list.size) { i ->
                     val (nm, n) = list[i]
-                    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val canFollow = Api.auth.isNotEmpty() && !nm.equals(myName, ignoreCase = true) && !isGuestAccount(nm)
+                    Row(Modifier.fillMaxWidth().clickable { openName = nm }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                         if (unit.isNotEmpty()) Text("${i + 1}", Modifier.width(28.dp), style = MaterialTheme.typography.bodySmall)
                         Avatar(nm, 36.dp)
                         Spacer(Modifier.width(10.dp))
                         Text(nm, Modifier.weight(1f), maxLines = 1)
-                        if (unit.isNotEmpty()) Text(compactNum(n) + " " + unit, fontWeight = FontWeight.Bold)
+                        if (unit.isNotEmpty()) Text(compactNum(n) + " " + unit, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        if (canFollow) {
+                            val on = tick >= 0 && Follows.has(pctx, nm)
+                            if (on) OutlinedButton({ Follows.toggle(pctx, nm); tick++ }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp), modifier = Modifier.padding(start = 6.dp)) { Text("Following", fontSize = 12.sp) }
+                            else Button({ Follows.toggle(pctx, nm); tick++ }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp), modifier = Modifier.padding(start = 6.dp)) { Text("Follow", fontSize = 12.sp) }
+                        }
                     }
                 }
             }
         }
     )
+    if (openName.isNotEmpty()) ProfileDialog(openName, false, openName.equals(myName, ignoreCase = true)) { openName = ""; tick++ }
 }
 
 @Composable

@@ -4,7 +4,11 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.net.Uri
 import android.widget.VideoView
 import androidx.activity.compose.BackHandler
@@ -22,6 +26,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
@@ -36,6 +41,8 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material3.Surface
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -64,10 +71,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
 
 const val MAX_VIDEO_MS = 8000L          // videos may be 8 seconds at most
 const val MAX_VIDEO_BYTES = 12_000_000L // and 12 MB
@@ -201,28 +210,115 @@ private fun preparePhoto(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, Str
     }
 }
 
-// Video: must be an MP4 of at most 8 seconds and 12 MB; frames at 0, 2, 4 and 6 seconds are checked on the phone.
-private fun prepareVideo(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, String> {
+// Video: MP4 of at most 8 seconds and 12 MB. A longer video is first trimmed by the user (TrimDialog).
+const val MAX_SOURCE_BYTES = 300_000_000L // the video the user picks, before trimming
+
+// copies the picked video into the app cache; returns "" when fine, otherwise the error text
+private fun copyVideo(ctx: Context, uri: Uri, dst: File): String {
     try {
         var total = 0L
         val copied = ctx.contentResolver.openInputStream(uri)?.use { inp ->
-            out.outputStream().use { o ->
+            dst.outputStream().use { o ->
                 val buf = ByteArray(65536)
                 while (true) {
                     val n = inp.read(buf)
                     if (n < 0) break
                     total += n
-                    if (total > MAX_VIDEO_BYTES) return Pair(null, "The video is too large (12 MB max). Pick a shorter clip.")
+                    if (total > MAX_SOURCE_BYTES) return "The video is too large (300 MB max)"
                     o.write(buf, 0, n)
                 }
             }
             true
         } ?: false
-        if (!copied) return Pair(null, "Could not read the video")
+        if (!copied) return "Could not read the video"
         val head = ByteArray(12)
-        out.inputStream().use { it.read(head) }
+        dst.inputStream().use { it.read(head) }
         if (!(head[4] == 0x66.toByte() && head[5] == 0x74.toByte() && head[6] == 0x79.toByte() && head[7] == 0x70.toByte()))
-            return Pair(null, "Only MP4 videos can be posted")
+            return "Only MP4 videos can be posted"
+        return ""
+    } catch (e: Exception) {
+        return "Could not read the video"
+    }
+}
+
+private fun videoDurationMs(f: File): Long {
+    val r = MediaMetadataRetriever()
+    return try {
+        r.setDataSource(f.absolutePath)
+        r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+    } catch (e: Exception) { 0L } finally {
+        try { r.release() } catch (e: Exception) {}
+    }
+}
+
+// Cuts [startUs, endUs] out of an MP4 without re-encoding (it starts at the key frame just before startUs; the result is kept under 8 s).
+// Returns "" when fine, otherwise the error text.
+private fun trimVideo(src: File, dst: File, startUs: Long, endUs: Long): String {
+    val ex = MediaExtractor()
+    var mux: MediaMuxer? = null
+    var started = false
+    try {
+        ex.setDataSource(src.absolutePath)
+        dst.delete()
+        mux = MediaMuxer(dst.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        val map = HashMap<Int, Int>()
+        var maxSize = 1 shl 20
+        for (i in 0 until ex.trackCount) {
+            val f = ex.getTrackFormat(i)
+            val mime = f.getString(MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                ex.selectTrack(i)
+                map[i] = mux.addTrack(f)
+                if (f.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) maxSize = maxOf(maxSize, f.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+            }
+        }
+        if (map.isEmpty()) return "Could not read the video"
+        val mr = MediaMetadataRetriever()
+        try {
+            mr.setDataSource(src.absolutePath)
+            val rot = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            mux.setOrientationHint(rot)
+        } catch (e: Exception) {} finally {
+            try { mr.release() } catch (e: Exception) {}
+        }
+        ex.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        mux.start()
+        started = true
+        val buf = ByteBuffer.allocate(maxSize)
+        val info = MediaCodec.BufferInfo()
+        var base = -1L
+        var wrote = 0
+        while (true) {
+            buf.clear()
+            val size = ex.readSampleData(buf, 0)
+            if (size < 0) break
+            val t = ex.sampleTime
+            if (base < 0) base = t
+            if (t > endUs || t - base > (MAX_VIDEO_MS - 100L) * 1000L) break
+            val track = map[ex.sampleTrackIndex]
+            if (track != null) {
+                info.set(0, size, maxOf(0L, t - base), if (ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+                mux.writeSampleData(track, buf, info)
+                wrote++
+            }
+            ex.advance()
+        }
+        mux.stop()
+        started = false
+        return if (wrote > 0) "" else "Could not trim the video"
+    } catch (e: Exception) {
+        return "Could not trim the video"
+    } finally {
+        try { if (started) mux?.stop() } catch (e: Exception) {}
+        try { mux?.release() } catch (e: Exception) {}
+        try { ex.release() } catch (e: Exception) {}
+    }
+}
+
+// checks a video file of 8 seconds at most: size, every second of it on the phone for nudity, and makes the thumbnail
+private fun checkVideo(out: File): Pair<PostPrep?, String> {
+    try {
+        if (out.length() > MAX_VIDEO_BYTES) return Pair(null, "The video is larger than 12 MB. Pick a shorter or lower-quality clip.")
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(out.absolutePath)
@@ -250,6 +346,53 @@ private fun prepareVideo(ctx: Context, uri: Uri, out: File): Pair<PostPrep?, Str
     }
 }
 
+// Lets the user choose the part of a longer video to post: drag the start and the end (at most 8 seconds apart)
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (Long, Long) -> Unit, onCancel: () -> Unit) {
+    val maxLen = MAX_VIDEO_MS.toFloat()
+    val total = durMs.toFloat()
+    var start by remember { mutableStateOf(0f) }
+    var end by remember { mutableStateOf(minOf(maxLen, total)) }
+    var vv by remember { mutableStateOf<VideoView?>(null) }
+    LaunchedEffect(vv) {
+        val v = vv ?: return@LaunchedEffect
+        while (true) {
+            delay(150)
+            if (v.isPlaying && v.currentPosition >= end.toInt()) v.seekTo(start.toInt())
+        }
+    }
+    fun mmss(ms: Long) = "%d:%02d.%d".format(ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100)
+    AlertDialog(
+        onDismissRequest = { if (!busy) onCancel() },
+        title = { Text("Trim your video") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Your video is ${mmss(durMs)} long. A post can be 8 seconds at most: drag the start and the end.")
+                AndroidView(factory = { c ->
+                    VideoView(c).apply {
+                        setVideoPath(src.absolutePath)
+                        setOnPreparedListener { mp -> mp.isLooping = false; mp.setVolume(0f, 0f); seekTo(0); start() }
+                        vv = this
+                    }
+                }, modifier = Modifier.fillMaxWidth().height(220.dp))
+                RangeSlider(start..end, { r ->
+                    var a = r.start
+                    var e = r.endInclusive
+                    val startMoved = a != start
+                    if (startMoved) a = a.coerceIn((e - maxLen).coerceAtLeast(0f), (e - 1000f).coerceAtLeast(0f))
+                    else e = e.coerceIn(minOf(a + 1000f, total), minOf(a + maxLen, total))
+                    start = a; end = e
+                    vv?.seekTo((if (startMoved) a else (e - 500f).coerceAtLeast(a)).toInt())
+                }, valueRange = 0f..total, onValueChangeFinished = { vv?.seekTo(start.toInt()); vv?.start() }, enabled = !busy)
+                Text("Part used: ${mmss(start.toLong())} to ${mmss(end.toLong())}  (${"%.1f".format((end - start) / 1000f)} s of 8 s max)", fontSize = 13.sp)
+            }
+        },
+        confirmButton = { Button({ vv?.pause(); onUse(start.toLong(), end.toLong()) }, enabled = !busy) { Text(if (busy) "Trimming…" else "Use this part") } },
+        dismissButton = { TextButton(onCancel, enabled = !busy) { Text("Cancel") } }
+    )
+}
+
 @Composable
 fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -264,6 +407,8 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
     var viewing by remember { mutableStateOf<Api.Post?>(null) }
     var writing by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf("") }
+    var trimSrc by remember { mutableStateOf<File?>(null) } // a picked video longer than 8 s, waiting to be trimmed
+    var trimDur by remember { mutableStateOf(0L) }
 
     suspend fun refresh() {
         loading = true
@@ -276,8 +421,20 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
         if (uri == null) return
         scope.launch {
             busy = true; msg = "Checking…"
-            val out = File(ctx.cacheDir, if (kind == "video") "post_upload.mp4" else "post_upload.jpg")
-            val r = withContext(Dispatchers.Default) { if (kind == "video") prepareVideo(ctx, uri, out) else preparePhoto(ctx, uri, out) }
+            if (kind == "video") {
+                val src = File(ctx.cacheDir, "post_source.mp4")
+                val e = withContext(Dispatchers.IO) { copyVideo(ctx, uri, src) }
+                if (e.isNotEmpty()) { busy = false; msg = e; return@launch }
+                val dur = withContext(Dispatchers.IO) { videoDurationMs(src) }
+                if (dur <= 0L) { busy = false; msg = "Could not read the video"; return@launch }
+                if (dur > MAX_VIDEO_MS + 300L) { trimSrc = src; trimDur = dur; busy = false; msg = ""; return@launch } // the user trims it first
+                val v = withContext(Dispatchers.Default) { checkVideo(src) }
+                busy = false
+                if (v.first != null) { prep = v.first; caption = ""; msg = "" } else msg = v.second
+                return@launch
+            }
+            val out = File(ctx.cacheDir, "post_upload.jpg")
+            val r = withContext(Dispatchers.Default) { preparePhoto(ctx, uri, out) }
             busy = false
             if (r.first != null) { prep = r.first; caption = ""; msg = "" } else msg = r.second
         }
@@ -316,7 +473,7 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
         title = { Text("New post") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Text only, a photo, or a video of 8 seconds at most (MP4, up to 12 MB).")
+                Text("Text only, a photo, or a video (MP4). A video can be 8 seconds at most: a longer one you can trim.")
                 Button({ showChoose = false; draft = ""; msg = ""; writing = true }, Modifier.fillMaxWidth()) { Text("✏️ Text only") }
                 Button({ showChoose = false; pickPhoto.launch("image/*") }, Modifier.fillMaxWidth()) { Text("📷 Photo") }
                 OutlinedButton({ showChoose = false; pickVideo.launch("video/*") }, Modifier.fillMaxWidth()) { Text("🎬 Video") }
@@ -351,6 +508,22 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
         },
         dismissButton = { TextButton({ writing = false; msg = "" }, enabled = !busy) { Text("Cancel") } }
     )
+
+    trimSrc?.let { src ->
+        TrimDialog(src, trimDur, busy, { startMs, endMs ->
+            scope.launch {
+                busy = true; msg = "Trimming…"
+                val out = File(ctx.cacheDir, "post_upload.mp4")
+                val e = withContext(Dispatchers.IO) { trimVideo(src, out, startMs * 1000L, endMs * 1000L) }
+                if (e.isNotEmpty()) { busy = false; msg = e; return@launch }
+                msg = "Checking…"
+                val v = withContext(Dispatchers.Default) { checkVideo(out) }
+                busy = false
+                trimSrc = null
+                if (v.first != null) { prep = v.first; caption = ""; msg = "" } else msg = v.second
+            }
+        }, { trimSrc = null; msg = "" })
+    }
 
     prep?.let { p ->
         AlertDialog(
