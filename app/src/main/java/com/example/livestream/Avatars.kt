@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -106,5 +107,19 @@ fun encodeSquare(ctx: Context, uri: Uri, out: Int, maxChars: Int): Pair<String, 
         return if (b64.length <= maxChars) Pair(b64, scaled) else null
     } catch (e: Exception) {
         return null
+    }
+}
+
+/** A small picture downloaded from a web address (used for YouTube search results). */
+@Composable
+fun UrlThumb(url: String, modifier: Modifier) {
+    val bmp by produceState<ImageBitmap?>(null, url) {
+        value = withContext(Dispatchers.IO) {
+            try { java.net.URL(url).openStream().use { BitmapFactory.decodeStream(it) }?.asImageBitmap() } catch (e: Exception) { null }
+        }
+    }
+    Box(modifier.background(Color.DarkGray)) {
+        val b = bmp
+        if (b != null) Image(b, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
     }
 }

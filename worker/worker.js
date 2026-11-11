@@ -296,7 +296,54 @@ export default {
         }
         return json({ name: acc.name, token: await newSession(env, acc.name) });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b141', accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
+      // Popular YouTube videos (1 quota unit, cached 2 hours): GET /yt-popular?c=music|all&r=<2-letter country>
+      if (req.method === 'GET' && u.pathname === '/yt-popular') {
+        if (!env.YT_KEY) return json({ error: 'YouTube search is not set up yet' }, 503);
+        const reg = /^[A-Za-z]{2}$/.test(u.searchParams.get('r') || '') ? u.searchParams.get('r').toUpperCase() : 'US';
+        const music = u.searchParams.get('c') === 'music';
+        const pk = 'yp:' + reg + (music ? ':m' : ':a');
+        if (env.DB) { const hit = await env.DB.get(pk, 'json'); if (hit) return json({ items: hit }); }
+        const r = await fetch('https://www.googleapis.com/youtube/v3/videos?part=snippet,status&chart=mostPopular&maxResults=30&regionCode=' + reg + (music ? '&videoCategoryId=10' : '') + '&key=' + env.YT_KEY);
+        if (!r.ok) return json({ error: 'YouTube failed (' + r.status + ')' }, 502);
+        const d = await r.json();
+        const dec = (t) => String(t || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+        const items = (d.items || []).filter((x) => x.id && x.status && x.status.embeddable).slice(0, 15).map((x) => ({
+          id: x.id,
+          title: dec(x.snippet.title).slice(0, 100),
+          channel: dec(x.snippet.channelTitle).slice(0, 40),
+          thumb: ((x.snippet.thumbnails && (x.snippet.thumbnails.medium || x.snippet.thumbnails.default)) || {}).url || ''
+        }));
+        if (env.DB) await env.DB.put(pk, JSON.stringify(items), { expirationTtl: 7200 });
+        return json({ items });
+      }
+      // YouTube search for the shared-video feature (needs the secret YT_KEY = a YouTube Data API v3 key). Results are cached 24 hours to save quota.
+      if (req.method === 'GET' && u.pathname === '/yt-search') {
+        if (!env.YT_KEY) return json({ error: 'YouTube search is not set up yet' }, 503);
+        const q = String(u.searchParams.get('q') || '').trim().slice(0, 80);
+        if (q.length < 2) return json({ items: [] });
+        const ck = 'yq:' + q.toLowerCase();
+        if (env.DB) {
+          const hit = await env.DB.get(ck, 'json');
+          if (hit) return json({ items: hit });
+          const rk = 'yr:' + (req.headers.get('cf-connecting-ip') || 'x');
+          const n = parseInt(await env.DB.get(rk), 10) || 0;
+          if (n >= 15) return json({ error: 'Too many searches, try again in a few minutes' }, 429);
+          await env.DB.put(rk, String(n + 1), { expirationTtl: 600 });
+        }
+        const r = await fetch('https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&videoSyndicated=true&safeSearch=moderate&maxResults=15&q=' + encodeURIComponent(q) + '&key=' + env.YT_KEY);
+        if (!r.ok) return json({ error: 'YouTube search failed (' + r.status + ')' }, 502);
+        const d = await r.json();
+        const dec = (t) => String(t || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+        const items = (d.items || []).filter((x) => x.id && x.id.videoId).map((x) => ({
+          id: x.id.videoId,
+          title: dec(x.snippet.title).slice(0, 100),
+          channel: dec(x.snippet.channelTitle).slice(0, 40),
+          thumb: ((x.snippet.thumbnails && (x.snippet.thumbnails.medium || x.snippet.thumbnails.default)) || {}).url || ''
+        }));
+        if (env.DB) await env.DB.put(ck, JSON.stringify(items), { expirationTtl: 86400 });
+        return json({ items });
+      }
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b143', youtube: !!env.YT_KEY, accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);

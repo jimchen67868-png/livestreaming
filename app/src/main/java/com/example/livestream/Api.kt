@@ -14,6 +14,7 @@ import org.json.JSONObject
 
 object Api {
     data class Stream(val id: String, val title: String, val host: String, val viewers: Int, val thumb: String = "", val type: String = "", val cc: String = "", val same: Boolean = false, val kind: String = "", val ratio: String = "")
+    data class YtItem(val id: String, val title: String, val channel: String, val thumb: String)
     data class Join(val id: String, val url: String, val token: String, val key: String = "")
 
     private val http = OkHttpClient()
@@ -143,6 +144,33 @@ object Api {
             }
         }
     } catch (e: Exception) { null }
+
+    /** Popular YouTube videos (all, or music only) for the phone's country; same result shape as ytSearch. */
+    fun ytPopular(server: String, music: Boolean): Pair<List<YtItem>, String?> = try {
+        val region = java.util.Locale.getDefault().country.ifEmpty { "US" }
+        val url = "${base(server)}/yt-popular?r=$region&c=" + (if (music) "music" else "all")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            val o = JSONObject(r.body!!.string())
+            if (!r.isSuccessful) Pair(emptyList(), o.optString("error", "Failed"))
+            else {
+                val a = o.optJSONArray("items") ?: JSONArray()
+                Pair((0 until a.length()).map { a.getJSONObject(it).let { x -> YtItem(x.optString("id"), x.optString("title"), x.optString("channel"), x.optString("thumb")) } }, null)
+            }
+        }
+    } catch (e: Exception) { Pair(emptyList(), "Can't reach the server") }
+
+    /** YouTube search through the server: the videos found, and an error text (null when fine). */
+    fun ytSearch(server: String, q: String): Pair<List<YtItem>, String?> = try {
+        val url = "${base(server)}/yt-search?q=" + java.net.URLEncoder.encode(q, "UTF-8")
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            val o = JSONObject(r.body!!.string())
+            if (!r.isSuccessful) Pair(emptyList(), o.optString("error", "Search failed"))
+            else {
+                val a = o.optJSONArray("items") ?: JSONArray()
+                Pair((0 until a.length()).map { a.getJSONObject(it).let { x -> YtItem(x.optString("id"), x.optString("title"), x.optString("channel"), x.optString("thumb")) } }, null)
+            }
+        }
+    } catch (e: Exception) { Pair(emptyList(), "Can't reach the server") }
 
     /** Tells the server about a follow / unfollow (fire and forget; the phone's own list still works without it). */
     fun followAsync(server: String, to: String, on: Boolean) {

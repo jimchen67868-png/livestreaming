@@ -33,6 +33,9 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -630,7 +633,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b145-trimrange"
+const val BUILD_TAG = "b149-ytpopular"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1546,6 +1549,9 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
     var ytCmd by remember { mutableStateOf<JSONObject?>(null) }
     var showYt by remember { mutableStateOf(false) }
     var ytText by remember { mutableStateOf("") }
+    var ytResults by remember { mutableStateOf(listOf<Api.YtItem>()) }
+    var ytMsg by remember { mutableStateOf("") }
+    var ytBusy by remember { mutableStateOf(false) }
     val shareLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
         val data = res.data
         if (res.resultCode == Activity.RESULT_OK && data != null) scope.launch {
@@ -1856,24 +1862,78 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
             fx.add(g, user)
             scope.launch { lk.send(JSONObject().put("t", "hgift").put("g", g).put("to", to)) }
         }) { showViewers = false }
-        if (showYt) AlertDialog(
-            onDismissRequest = { showYt = false },
-            title = { Text("Play a YouTube video") },
-            text = { OutlinedTextField(ytText, { ytText = it }, label = { Text("Paste a YouTube link") }, singleLine = true) },
-            confirmButton = {
-                TextButton({
-                    val id = youtubeId(ytText)
-                    if (id == null) notice = "That is not a YouTube link."
-                    else { ytId = id; ytCmd = JSONObject().put("id", id).put("play", true).put("pos", 0); showYt = false }
-                }) { Text("Play for everyone") }
-            },
-            dismissButton = {
-                if (ytId.isNotEmpty()) TextButton({
-                    scope.launch { try { lk.send(JSONObject().put("t", "yt").put("id", "")) } catch (e: Exception) {} }
-                    ytId = ""; ytCmd = null; showYt = false
-                }) { Text("Stop video") } else TextButton({ showYt = false }) { Text("Cancel") }
+        if (showYt) {
+            val playYt = { id: String ->
+                ytId = id; ytCmd = JSONObject().put("id", id).put("play", true).put("pos", 0); showYt = false
             }
-        )
+            val doYtSearch = {
+                val q = ytText.trim()
+                if (q.length >= 2 && !ytBusy) {
+                    ytBusy = true; ytMsg = ""
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { Api.ytSearch(server, q) }
+                        ytBusy = false
+                        ytResults = r.first
+                        ytMsg = r.second ?: if (r.first.isEmpty()) "No videos found" else ""
+                    }
+                }
+            }
+            val loadPop = { music: Boolean ->
+                if (!ytBusy) {
+                    ytBusy = true; ytMsg = ""
+                    scope.launch {
+                        val r = withContext(Dispatchers.IO) { Api.ytPopular(server, music) }
+                        ytBusy = false
+                        ytResults = r.first
+                        ytMsg = r.second ?: if (r.first.isEmpty()) "Nothing to show" else ""
+                    }
+                }
+            }
+            LaunchedEffect(Unit) { if (ytResults.isEmpty()) loadPop(false) }
+            AlertDialog(
+                onDismissRequest = { showYt = false },
+                title = { Text("Play a YouTube video") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(ytText, { ytText = it }, label = { Text("Search YouTube or paste a link") }, singleLine = true,
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search), keyboardActions = KeyboardActions(onSearch = { doYtSearch() }),
+                            modifier = Modifier.fillMaxWidth())
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Button({ doYtSearch() }, enabled = !ytBusy && ytText.trim().length >= 2 && youtubeId(ytText) == null) { Text(if (ytBusy) "Loading…" else "Search") }
+                            OutlinedButton({ loadPop(false) }, enabled = !ytBusy) { Text("Popular") }
+                            OutlinedButton({ loadPop(true) }, enabled = !ytBusy) { Text("Music") }
+                        }
+                        if (ytMsg.isNotEmpty()) Text(ytMsg, fontSize = 12.sp)
+                        if (ytResults.isNotEmpty()) LazyColumn(Modifier.fillMaxWidth().heightIn(max = 270.dp)) {
+                            items(ytResults.size) { i ->
+                                val v = ytResults[i]
+                                Row(Modifier.fillMaxWidth().clickable { playYt(v.id) }.padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    UrlThumb(v.thumb, Modifier.width(96.dp).height(54.dp).clip(RoundedCornerShape(6.dp)))
+                                    Spacer(Modifier.width(8.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(v.title, maxLines = 2, fontSize = 13.sp)
+                                        Text(v.channel, maxLines = 1, fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton({
+                        val id = youtubeId(ytText)
+                        if (id == null) notice = "That is not a YouTube link. Tap a search result to play it."
+                        else playYt(id)
+                    }) { Text("Play link for everyone") }
+                },
+                dismissButton = {
+                    if (ytId.isNotEmpty()) TextButton({
+                        scope.launch { try { lk.send(JSONObject().put("t", "yt").put("id", "")) } catch (e: Exception) {} }
+                        ytId = ""; ytCmd = null; showYt = false
+                    }) { Text("Stop video") } else TextButton({ showYt = false }) { Text("Cancel") }
+                }
+            )
+        }
         if (showPick) {
             var list by remember { mutableStateOf(listOf<Api.Stream>()) }
             LaunchedEffect(Unit) {
