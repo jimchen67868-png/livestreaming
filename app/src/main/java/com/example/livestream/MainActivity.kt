@@ -630,7 +630,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b137-livebutton"
+const val BUILD_TAG = "b138-toolschat"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -970,7 +970,7 @@ fun SideBtn(text: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (String) -> Unit) {
+fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Boolean = true, onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
     Column(modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         // scrollable: swipe up to read older messages; it follows new messages unless you scrolled up
@@ -992,7 +992,9 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, onSend: (Stri
                         .padding(horizontal = 8.dp, vertical = 2.dp))
             }
         }
-        if (Api.auth.isEmpty()) {
+        if (!showInput) {
+            // input hidden (broadcast screen): the 💬 button shows it
+        } else if (Api.auth.isEmpty()) {
             Text("Log in (👤 on Home) to chat", color = Color.White, modifier = Modifier
                 .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
         } else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1867,14 +1869,14 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 text = { Text("${inv.second} invites you to a PK battle. Your viewers will follow you.") }
             )
         }
+        var showTools by remember { mutableStateOf(false) } // the live tools (mic, PK, flip, record...) are hidden until the Tools button is tapped
+        var showChat by remember { mutableStateOf(false) } // the chat input is hidden until the Chat button is tapped
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, onSend = {
+            if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, showInput = showChat, onSend = {
                 msgs.addCapped("$user (broadcaster): $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
-            // Go Live / End has its own full-width row so it is always visible; the other buttons scroll sideways on a narrow phone
-            Button({ if (live) stop() else goLive() }, Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 12.dp), enabled = live || countdown == 0) { Text(if (live) "End" else if (countdown > 0) "Starting…" else "Go Live") }
-            Row(Modifier.horizontalScroll(rememberScrollState()).padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (showTools) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp).padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton({
                     scope.launch {
                         try { lk.localParticipant.setMicrophoneEnabled(muted); muted = !muted }
@@ -1899,7 +1901,13 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
                 OutlinedButton({
                     if (FloatChat.canShow(ctx)) android.widget.Toast.makeText(ctx, "Floating chat is on: it shows when you leave the app", android.widget.Toast.LENGTH_LONG).show()
                     else FloatChat.askPermission(ctx)
-                }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("💬") }
+                }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text("Float chat") }
+            }
+            // Go Live / End always stays visible; Tools and Chat open the rest
+            Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button({ if (live) stop() else goLive() }, Modifier.weight(1f), enabled = live || countdown == 0) { Text(if (live) "End" else if (countdown > 0) "Starting…" else "Go Live") }
+                OutlinedButton({ showTools = !showTools }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text(if (showTools) "Tools ▾" else "Tools ▴") }
+                OutlinedButton({ showChat = !showChat }, contentPadding = PaddingValues(horizontal = 12.dp)) { Text(if (showChat) "Chat ✕" else "Chat") }
             }
         }
     }
