@@ -46,6 +46,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // Live video (WebRTC) via LiveKit Cloud
     implementation("io.livekit:livekit-android:2.26.1")
+    implementation("androidx.media3:media3-exoplayer:1.4.1") // exact preview of the trimmed video
+    implementation("androidx.media3:media3-transformer:1.4.1") // exact trimming of the posted video
     implementation("com.pierfrancescosoffritti.androidyoutubeplayer:core:13.0.0")
     // On-device nudity detection
     implementation("org.tensorflow:tensorflow-lite:2.16.1")

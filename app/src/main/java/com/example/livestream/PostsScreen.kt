@@ -14,6 +14,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.media.MediaPlayer
 import android.net.Uri
+import android.view.TextureView
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.VideoView
@@ -33,6 +34,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
@@ -82,8 +85,23 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -363,7 +381,7 @@ private fun trimVideo(src: File, dst: File, startUs: Long, endUs: Long, keepAudi
 private class Pcm(val data: ShortArray, val rate: Int, val ch: Int)
 private class AacFrame(val data: ByteArray, val pts: Long, val flags: Int)
 private class Aac(val format: MediaFormat, val frames: List<AacFrame>)
-class TrimChoice(val startMs: Long, val endMs: Long, val mute: Boolean, val music: Uri?, val musicVol: Float)
+class TrimChoice(val startMs: Long, val endMs: Long, val mute: Boolean, val music: Uri?, val musicVol: Float, val musicStartMs: Long = 0L)
 
 // decodes the audio track of a file / uri from startUs for about lenUs into 16-bit PCM; null if there is no audio
 private fun decodeAudio(open: (MediaExtractor) -> Unit, startUs: Long, lenUs: Long): Pcm? {
@@ -590,60 +608,80 @@ private fun muxVideoAndAudio(vOnly: File, aac: Aac, dst: File): String {
     }
 }
 
-// builds the video to post from the user's choices: cut, original sound on/off, music. Returns "" when fine, otherwise the error text.
-private fun buildClip(ctx: Context, src: File, dst: File, c: TrimChoice): String {
-    val music = c.music
-    if (music == null) return trimVideo(src, dst, c.startMs * 1000L, c.endMs * 1000L, keepAudio = !c.mute).err
-    val vOnly = File(ctx.cacheDir, "post_video_only.mp4")
-    val r = trimVideo(src, vOnly, c.startMs * 1000L, c.endMs * 1000L, keepAudio = false)
-    if (r.err.isNotEmpty()) return r.err
-    val frames = (r.durUs * 44100L / 1000000L).toInt().coerceAtLeast(22050)
-    val song = decodeAudio({ it.setDataSource(ctx, music, null) }, 0L, r.durUs + 1000000L) ?: return "Could not read this music file"
-    val mus = toStereo44(song, frames, true)
-    var org: ShortArray? = null
-    if (!c.mute) {
-        val o = decodeAudio({ it.setDataSource(src.absolutePath) }, r.baseUs, r.durUs)
-        if (o != null) org = toStereo44(o, frames, false)
+// Exact cut with re-encoding (Media3 Transformer): starts at the chosen frame, not at a key frame. "" when fine, otherwise the error text.
+private suspend fun exportExact(ctx: Context, src: File, dst: File, startMs: Long, endMs: Long, removeAudio: Boolean): String {
+    val r = withTimeoutOrNull(90000L) {
+        withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine<String> { cont ->
+                try {
+                    dst.delete()
+                    val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(startMs).setEndPositionMs(endMs).build()
+                    val item = EditedMediaItem.Builder(MediaItem.Builder().setUri(Uri.fromFile(src)).setClippingConfiguration(clip).build())
+                        .setRemoveAudio(removeAudio)
+                        .build()
+                    val enc = DefaultEncoderFactory.Builder(ctx)
+                        .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(6000000).build())
+                        .build()
+                    val t = Transformer.Builder(ctx)
+                        .setVideoMimeType(MimeTypes.VIDEO_H264)
+                        .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        .setEncoderFactory(enc)
+                        .addListener(object : Transformer.Listener {
+                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                                if (cont.isActive) cont.resume("")
+                            }
+                            override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                                if (cont.isActive) cont.resume("Could not trim the video")
+                            }
+                        })
+                        .build()
+                    cont.invokeOnCancellation { try { t.cancel() } catch (e: Exception) {} }
+                    t.start(item, dst.absolutePath)
+                } catch (e: Exception) {
+                    if (cont.isActive) cont.resume("Could not trim the video")
+                }
+            }
+        }
     }
-    val mix = ShortArray(frames * 2)
-    for (i in mix.indices) {
-        val v = (mus[i] * c.musicVol + (if (org != null) org[i].toInt() else 0)).toInt()
-        mix[i] = v.coerceIn(-32768, 32767).toShort()
-    }
-    val aac = encodeAac(mix) ?: return "Could not add the music"
-    val e = muxVideoAndAudio(vOnly, aac, dst)
-    vOnly.delete()
-    return e
+    return r ?: "Trimming took too long"
 }
 
-// checks a video file of 8 seconds at most: size, every second of it on the phone for nudity, and makes the thumbnail
-private fun checkVideo(out: File): Pair<PostPrep?, String> {
-    try {
-        if (out.length() > MAX_VIDEO_BYTES) return Pair(null, "The video is larger than 12 MB. Pick a shorter or lower-quality clip.")
-        val r = MediaMetadataRetriever()
-        try {
-            r.setDataSource(out.absolutePath)
-            val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            if (dur <= 0L) return Pair(null, "Could not read the video")
-            if (dur > MAX_VIDEO_MS + 300L) return Pair(null, "The video must be 8 seconds or shorter (yours is ${dur / 1000} s)")
-            // uploading: only the phone checks, every second of the video
-            var thumb: String? = null
-            var t = 0L
-            while (t < dur) {
-                val f = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                if (f != null) {
-                    if (LocalGuard.suspicious(f)) return Pair(null, "This video looks inappropriate and cannot be posted")
-                    if (thumb == null) thumb = squareThumbOf(f)
-                }
-                t += 1000L
-            }
-            val th = thumb ?: return Pair(null, "Could not read the video")
-            return Pair(PostPrep("video", out, th), "")
-        } finally {
-            try { r.release() } catch (e: Exception) {}
+// builds the video to post from the user's choices: exact cut, original sound on/off, music. Returns "" when fine, otherwise the error text.
+private suspend fun buildClip(ctx: Context, src: File, dst: File, c: TrimChoice): String {
+    val music = c.music
+    val removeAudio = c.mute || music != null
+    val picture = if (music == null) dst else File(ctx.cacheDir, "post_video_only.mp4")
+    var baseUs = c.startMs * 1000L
+    var durUs = (c.endMs - c.startMs) * 1000L
+    var e = exportExact(ctx, src, picture, c.startMs, c.endMs, removeAudio)
+    if (e.isNotEmpty() || !picture.exists() || picture.length() < 1000L) {
+        // the exact cut did not work on this phone: fall back to cutting at the nearest key frame
+        val r = withContext(Dispatchers.IO) { trimVideo(src, picture, c.startMs * 1000L, c.endMs * 1000L, keepAudio = !removeAudio) }
+        if (r.err.isNotEmpty()) return r.err
+        baseUs = r.baseUs
+        durUs = r.durUs
+        e = ""
+    }
+    if (music == null) return e
+    return withContext(Dispatchers.IO) {
+        val frames = (durUs * 44100L / 1000000L).toInt().coerceAtLeast(22050)
+        val song = decodeAudio({ it.setDataSource(ctx, music, null) }, c.musicStartMs * 1000L, durUs + 1000000L)
+        if (song == null) return@withContext "Could not read this music file"
+        val mus = toStereo44(song, frames, true)
+        var org: ShortArray? = null
+        if (!c.mute) {
+            val o = decodeAudio({ it.setDataSource(src.absolutePath) }, baseUs, durUs)
+            if (o != null) org = toStereo44(o, frames, false)
         }
-    } catch (e: Exception) {
-        return Pair(null, "Could not read the video")
+        val mix = ShortArray(frames * 2)
+        for (i in mix.indices) {
+            val v = (mus[i] * c.musicVol + (if (org != null) org[i].toInt() else 0)).toInt()
+            mix[i] = v.coerceIn(-32768, 32767).toShort()
+        }
+        val aac = encodeAac(mix) ?: return@withContext "Could not add the music"
+        val err = muxVideoAndAudio(picture, aac, dst)
+        picture.delete()
+        err
     }
 }
 
@@ -725,7 +763,8 @@ private fun MusicDialog(onPick: (Uri, String) -> Unit, onClose: () -> Unit) {
     )
 }
 
-// Edit a video before posting: choose the part (start and end, or a fixed length that slides), mute the original sound, add music
+// Edit a video before posting: choose the part (start and end, or a fixed length that slides), mute the original sound, add music.
+// The preview plays exactly the chosen part (ExoPlayer), and the posted video is cut at the same frames.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice) -> Unit, onCancel: () -> Unit) {
@@ -739,40 +778,79 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
     var music by remember { mutableStateOf<Uri?>(null) }
     var musicName by remember { mutableStateOf("") }
     var musicVol by remember { mutableStateOf(0.8f) }
+    var musicStart by remember { mutableStateOf(0f) } // where in the song the music part begins (ms)
+    var musicDur by remember { mutableStateOf(0L) }   // length of the song (ms), 0 = unknown
     var showMusic by remember { mutableStateOf(false) }
-    var vv by remember { mutableStateOf<VideoView?>(null) }
-    var vmp by remember { mutableStateOf<MediaPlayer?>(null) }
-    var mus by remember { mutableStateOf<MediaPlayer?>(null) }
-    var startMoved by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
+    var ratio by remember { mutableStateOf(16f / 9f) }
+    val exo = remember { ExoPlayer.Builder(ctx).build() }      // plays the chosen part of the video, in a loop
+    val musicExo = remember { ExoPlayer.Builder(ctx).build() } // plays the chosen music, in a loop
 
-    fun restart() {
-        vv?.seekTo(start.toInt())
-        vv?.start()
-        try { mus?.seekTo(0); mus?.start() } catch (e: Exception) {}
+    // the part of the song that is used: as long as the video part, beginning at musicStart
+    fun musicFrom(): Long {
+        val len = (end - start).toLong().coerceAtLeast(500L)
+        return if (musicDur > 0L) minOf(musicStart.toLong(), (musicDur - len).coerceAtLeast(0L)) else musicStart.toLong()
     }
-    LaunchedEffect(vv) {
-        val v = vv ?: return@LaunchedEffect
-        while (true) {
-            delay(40)
-            if (v.isPlaying && v.currentPosition >= end.toInt()) restart()
+    fun loadMusic() {
+        val m = music ?: return
+        val len = (end - start).toLong().coerceAtLeast(500L)
+        val ms = musicFrom()
+        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(ms).setEndPositionMs(if (musicDur > 0L) minOf(ms + len, musicDur) else ms + len).build()
+        musicExo.setMediaItem(MediaItem.Builder().setUri(m).setClippingConfiguration(clip).build())
+        musicExo.prepare()
+        musicExo.volume = musicVol
+        musicExo.playWhenReady = true
+    }
+    // (re)loads the preview with the current start / end
+    fun loadClip() {
+        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(start.toLong()).setEndPositionMs(maxOf(end.toLong(), start.toLong() + 500L)).build()
+        exo.setMediaItem(MediaItem.Builder().setUri(Uri.fromFile(src)).setClippingConfiguration(clip).build())
+        exo.prepare()
+        exo.playWhenReady = true
+        loadMusic()
+    }
+    DisposableEffect(Unit) {
+        exo.repeatMode = Player.REPEAT_MODE_ONE
+        musicExo.repeatMode = Player.REPEAT_MODE_ALL
+        exo.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.height > 0 && videoSize.width > 0) ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+            }
+        })
+        loadClip()
+        onDispose {
+            try { exo.release() } catch (e: Exception) {}
+            try { musicExo.release() } catch (e: Exception) {}
         }
     }
-    LaunchedEffect(mute, vmp) { vmp?.setVolume(if (mute) 0f else 1f, if (mute) 0f else 1f) }
-    LaunchedEffect(musicVol, mus) { mus?.setVolume(musicVol, musicVol) }
-    DisposableEffect(music) {
-        val uri = music
-        val player: MediaPlayer? = if (uri == null) null else try {
-            MediaPlayer().apply {
-                setDataSource(ctx, uri)
-                setOnPreparedListener { mp -> mp.setVolume(musicVol, musicVol); mus = mp; restart() }
-                setOnErrorListener { _, _, _ -> true }
-                prepareAsync()
+    LaunchedEffect(Unit) { // when the video loops, the music starts again with it
+        var last = 0L
+        while (true) {
+            delay(100)
+            val p = exo.currentPosition
+            if (music != null && p + 300L < last) musicExo.seekTo(0L)
+            last = p
+        }
+    }
+    LaunchedEffect(mute) { exo.volume = if (mute) 0f else 1f }
+    LaunchedEffect(musicVol) { musicExo.volume = musicVol }
+    LaunchedEffect(music) {
+        val m = music
+        musicStart = 0f
+        if (m == null) {
+            musicDur = 0L
+            musicExo.stop()
+            musicExo.clearMediaItems()
+        } else {
+            musicDur = withContext(Dispatchers.IO) {
+                try {
+                    val r = MediaMetadataRetriever()
+                    r.setDataSource(ctx, m)
+                    val d = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                    r.release()
+                    d
+                } catch (e: Exception) { 0L }
             }
-        } catch (e: Exception) { null }
-        onDispose {
-            mus = null
-            try { player?.release() } catch (e: Exception) {}
+            loadClip() // video and music start together
         }
     }
     fun mmss(ms: Long) = "%d:%02d.%d".format(ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100)
@@ -781,25 +859,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         val e = minOf(total, start + l)
         end = e
         start = (e - l).coerceAtLeast(0f)
-        restart()
-    }
-    fun finishDrag() {
-        scope.launch {
-            if (startMoved) { // the clip can only begin on a key frame: snap to the nearest one so the preview is exactly what is posted
-                startMoved = false
-                start = withContext(Dispatchers.IO) { nearestSyncMs(src, start.toLong()) }.toFloat().coerceIn(0f, total)
-                if (lockLen > 0f) {
-                    val l = minOf(lockLen, total)
-                    end = start + l
-                    if (end > total) { end = total; start = (end - l).coerceAtLeast(0f) }
-                } else {
-                    if (end - start > maxLen) end = start + maxLen
-                    if (end - start < 1000f) end = minOf(total, start + 1000f)
-                    if (end - start < 1000f) start = (end - 1000f).coerceAtLeast(0f)
-                }
-            }
-            restart()
-        }
+        loadClip()
     }
     AlertDialog(
         onDismissRequest = { if (!busy) onCancel() },
@@ -807,13 +867,9 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Your video is ${mmss(durMs)} long. A post can be 8 seconds at most. The preview plays exactly the part that will be posted.")
-                AndroidView(factory = { c ->
-                    VideoView(c).apply {
-                        setVideoPath(src.absolutePath)
-                        setOnPreparedListener { mp -> mp.isLooping = false; vmp = mp; seekTo(0); this.start() }
-                        vv = this
-                    }
-                }, modifier = Modifier.fillMaxWidth().height(200.dp))
+                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
+                    AndroidView(factory = { c -> TextureView(c).also { exo.setVideoTextureView(it) } }, modifier = Modifier.aspectRatio(ratio))
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Length", fontSize = 13.sp)
                     FilterChip(selected = lockLen == 0f, onClick = { lockLen = 0f }, label = { Text("Free") }, enabled = !busy)
@@ -823,23 +879,23 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                 }
                 if (lockLen > 0f) {
                     val l = minOf(lockLen, total)
-                    Slider(start, { v ->
-                        startMoved = true
-                        start = v.coerceIn(0f, (total - l).coerceAtLeast(0f))
+                    // two handles, one fixed length: dragging either one moves both together
+                    RangeSlider(start..end, { r ->
+                        exo.pause()
+                        val ns = if (r.start != start) r.start else r.endInclusive - l
+                        start = ns.coerceIn(0f, (total - l).coerceAtLeast(0f))
                         end = start + l
-                        vv?.seekTo(start.toInt())
-                    }, valueRange = 0f..maxOf(total - l, 1f), onValueChangeFinished = { finishDrag() }, enabled = !busy)
+                    }, valueRange = 0f..total, onValueChangeFinished = { loadClip() }, enabled = !busy)
                 } else {
                     RangeSlider(start..end, { r ->
+                        exo.pause()
                         var a = r.start
                         var e = r.endInclusive
                         val moved = a != start
-                        if (moved) startMoved = true
                         if (moved) a = a.coerceIn((e - maxLen).coerceAtLeast(0f), (e - 1000f).coerceAtLeast(0f))
                         else e = e.coerceIn(minOf(a + 1000f, total), minOf(a + maxLen, total))
                         start = a; end = e
-                        vv?.seekTo((if (moved) a else (e - 500f).coerceAtLeast(a)).toInt())
-                    }, valueRange = 0f..total, onValueChangeFinished = { finishDrag() }, enabled = !busy)
+                    }, valueRange = 0f..total, onValueChangeFinished = { loadClip() }, enabled = !busy)
                 }
                 Text("Part used: ${mmss(start.toLong())} to ${mmss(end.toLong())}  (${"%.1f".format((end - start) / 1000f)} s of 8 s max)" + if (lockLen > 0f) "  - drag to move the whole part" else "", fontSize = 13.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -854,14 +910,20 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                 if (music != null) {
                     Text("Music volume", fontSize = 12.sp)
                     Slider(musicVol, { musicVol = it }, valueRange = 0f..1f, enabled = !busy)
+                    val mlen = (end - start).toLong().coerceAtLeast(500L)
+                    if (musicDur > mlen + 500L) {
+                        Text("Music part: ${mmss(musicFrom())} to ${mmss(musicFrom() + mlen)} of ${mmss(musicDur)}  - slide to choose where the music starts", fontSize = 12.sp)
+                        Slider(minOf(musicStart, (musicDur - mlen).toFloat()), { musicStart = it; musicExo.pause() },
+                            valueRange = 0f..(musicDur - mlen).toFloat(), onValueChangeFinished = { loadMusic(); musicExo.seekTo(0L) }, enabled = !busy)
+                    }
                 }
             }
         },
         confirmButton = {
             Button({
-                vv?.pause()
-                try { mus?.pause() } catch (e: Exception) {}
-                onUse(TrimChoice(start.toLong(), end.toLong(), mute, music, musicVol))
+                exo.pause()
+                musicExo.pause()
+                onUse(TrimChoice(start.toLong(), end.toLong(), mute, music, musicVol, musicFrom()))
             }, enabled = !busy) { Text(if (busy) "Working…" else "Use this") }
         },
         dismissButton = { TextButton(onCancel, enabled = !busy) { Text("Cancel") } }
@@ -988,7 +1050,7 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
                 busy = true; msg = "Preparing video…"
                 val out = File(ctx.cacheDir, "post_upload.mp4")
                 val untouched = ch.startMs == 0L && ch.endMs >= trimDur - 150L && !ch.mute && ch.music == null && trimDur <= MAX_VIDEO_MS + 300L
-                val e = if (untouched) "" else withContext(Dispatchers.IO) { buildClip(ctx, src, out, ch) }
+                val e = if (untouched) "" else buildClip(ctx, src, out, ch)
                 if (e.isNotEmpty()) { busy = false; msg = e; return@launch }
                 msg = "Checking…"
                 val v = withContext(Dispatchers.Default) { checkVideo(if (untouched) src else out) }
