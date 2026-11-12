@@ -685,6 +685,37 @@ private suspend fun buildClip(ctx: Context, src: File, dst: File, c: TrimChoice)
     }
 }
 
+// checks a video file of 8 seconds at most: size, every second of it on the phone for nudity, and makes the thumbnail
+private fun checkVideo(out: File): Pair<PostPrep?, String> {
+    try {
+        if (out.length() > MAX_VIDEO_BYTES) return Pair(null, "The video is larger than 12 MB. Pick a shorter or lower-quality clip.")
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(out.absolutePath)
+            val dur = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            if (dur <= 0L) return Pair(null, "Could not read the video")
+            if (dur > MAX_VIDEO_MS + 300L) return Pair(null, "The video must be 8 seconds or shorter (yours is ${dur / 1000} s)")
+            // uploading: only the phone checks, every second of the video
+            var thumb: String? = null
+            var t = 0L
+            while (t < dur) {
+                val f = r.getFrameAtTime(t * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                if (f != null) {
+                    if (LocalGuard.suspicious(f)) return Pair(null, "This video looks inappropriate and cannot be posted")
+                    if (thumb == null) thumb = squareThumbOf(f)
+                }
+                t += 1000L
+            }
+            val th = thumb ?: return Pair(null, "Could not read the video")
+            return Pair(PostPrep("video", out, th), "")
+        } finally {
+            try { r.release() } catch (e: Exception) {}
+        }
+    } catch (e: Exception) {
+        return Pair(null, "Could not read the video")
+    }
+}
+
 private class Song(val uri: Uri, val title: String, val artist: String)
 
 // songs on the phone whose title or artist contains q
