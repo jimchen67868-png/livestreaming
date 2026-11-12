@@ -50,20 +50,33 @@ object LiveAlerts {
         } catch (e: Exception) {}
     }
 
-    fun check(ctx: Context) {
-        if (!enabled(ctx)) return
+    private fun log(ctx: Context, line: String) {
+        ctx.getSharedPreferences("diag", 0).edit().putString("alerts", java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date()) + " " + line).apply()
+    }
+
+    fun scheduled(ctx: Context): Boolean = try { ctx.getSystemService(JobScheduler::class.java).allPendingJobs.any { it.id == JOB_ID } } catch (e: Exception) { false }
+
+    // force = used by "Check alerts now" in the diagnostics: shows the alert even if the app is open or it was shown before
+    fun check(ctx: Context, force: Boolean = false) {
+        if (!enabled(ctx)) { log(ctx, "alerts are off"); return }
         val sp = ctx.getSharedPreferences("s", 0)
         val follows = Follows.list(ctx).toSet() // already lower case
-        if (follows.isEmpty()) return
+        if (follows.isEmpty()) { log(ctx, "you follow nobody on this phone"); return }
         val server = if (DEFAULT_SERVER.isNotBlank()) DEFAULT_SERVER else (sp.getString("server", "") ?: "")
-        if (server.isBlank()) return
-        val live = Api.streams(server)
+        if (server.isBlank()) { log(ctx, "no server"); return }
+        val live = try { Api.streams(server) } catch (e: Exception) { log(ctx, "can't reach the server"); return }
         val seen = sp.getStringSet("alerted", emptySet()) ?: emptySet()
         val liveIds = live.map { it.id }.toSet()
-        val fresh = live.filter { it.host.trim().lowercase() in follows && it.id !in seen }
+        val mine = live.filter { it.host.trim().lowercase() in follows }
+        val fresh = if (force) mine else mine.filter { it.id !in seen }
+        val canShow = notifAllowed(ctx)
+        // a live is only remembered as "alerted" once the notification could really be shown
+        val remembered = if (canShow) fresh.map { it.id } else emptyList()
         // forget rooms that ended, so the same host going live again later notifies again
-        sp.edit().putStringSet("alerted", (seen.intersect(liveIds) + fresh.map { it.id }).toSet()).apply()
-        if (appVisible || !notifAllowed(ctx) || fresh.isEmpty()) return
+        sp.edit().putStringSet("alerted", (seen.intersect(liveIds) + remembered).toSet()).apply()
+        log(ctx, "follows=" + follows.size + " live=" + live.size + " followed live=" + mine.size + " new=" + fresh.size +
+            (if (!canShow) " NOT SHOWN: notifications are not allowed for this app" else if (appVisible && !force) " (app is open: no pop-up)" else ""))
+        if ((appVisible && !force) || !canShow || fresh.isEmpty()) return
         val nm = ctx.getSystemService(NotificationManager::class.java)
         if (android.os.Build.VERSION.SDK_INT >= 26)
             nm.createNotificationChannel(NotificationChannel("followlive", "Followed hosts go live", NotificationManager.IMPORTANCE_HIGH))

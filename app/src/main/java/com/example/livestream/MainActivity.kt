@@ -633,7 +633,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b151-musictrim"
+const val BUILD_TAG = "b154-livepreview"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -651,6 +651,9 @@ fun diagText(ctx: Context): String {
     sb.append("destroy: ").append(d.getString("destroy", "-")).append("\n")
     sb.append("swipe: ").append(d.getString("swipe", "-")).append("\n")
     sb.append("crash: ").append(d.getString("crash", "none")).append("\n")
+    sb.append("live alerts: ").append(if (LiveAlerts.enabled(ctx)) "on" else "off").append(", job scheduled: ").append(if (LiveAlerts.scheduled(ctx)) "yes" else "NO")
+        .append(", notifications allowed: ").append(if (notifAllowed(ctx)) "yes" else "NO").append(", following: ").append(Follows.list(ctx).size).append("\n")
+    sb.append("last alert check: ").append(d.getString("alerts", "never run yet")).append("\n")
     if (android.os.Build.VERSION.SDK_INT >= 30) {
         try {
             val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
@@ -767,7 +770,7 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
         }
     }
     var viewingPost by remember { mutableStateOf<Api.Post?>(null) }
-    var listKind by remember { mutableStateOf("") } // "", "followers" or "following"
+    var listKind by remember { mutableStateOf("") } // "", "followers", "following", "lumis" or "diamonds"
     val following0 = remember(name) { Follows.has(fctx, name) } // state when the dialog opened (the server count already includes it)
     AlertDialog(
         onDismissRequest = onClose,
@@ -781,8 +784,8 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
                     val nowFollowing = tick >= 0 && Follows.has(fctx, name)
                     val adj = (if (nowFollowing) 1 else 0) - (if (following0) 1 else 0)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-")
-                        StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-")
+                        StatBox("Lumis", info?.received?.let { compactNum(it) } ?: "-") { listKind = "lumis" }
+                        StatBox("Diamonds", info?.spent?.let { compactNum(it) } ?: "-") { listKind = "diamonds" }
                         StatBox("Followers", info?.let { compactNum((it.followers + adj).coerceAtLeast(0).toLong()) } ?: "-") { listKind = "followers" }
                         StatBox("Following", info?.following?.let { compactNum(it.toLong()) } ?: "-") { listKind = "following" }
                     }
@@ -817,7 +820,9 @@ fun ProfileDialog(name: String, isHost: Boolean, isMe: Boolean, onClose: () -> U
             }
         }
     )
-    if (listKind.isNotEmpty()) PeopleDialog(if (listKind == "followers") "Followers" else "Following", "", { Api.people(Api.serverUrl, name, listKind)?.map { it to 0L } }) { listKind = "" }
+    if (listKind == "lumis") PeopleDialog("Lumis from", "lumis", { Api.lumisFrom(Api.serverUrl, name) }) { listKind = "" }
+    else if (listKind == "diamonds") PeopleDialog("Diamonds sent to", "diamonds", { Api.diamondsTo(Api.serverUrl, name) }) { listKind = "" }
+    else if (listKind.isNotEmpty()) PeopleDialog(if (listKind == "followers") "Followers" else "Following", "", { Api.people(Api.serverUrl, name, listKind)?.map { it to 0L } }) { listKind = "" }
     viewingPost?.let { PostViewer(Api.serverUrl, it, mine = isMe && Api.auth.isNotEmpty(), onClose = { viewingPost = null }, onDeleted = { viewingPost = null }) }
 }
 
@@ -1086,8 +1091,9 @@ fun PermGate(onBack: () -> Unit, content: @Composable () -> Unit) {
 private val notifLines = mutableListOf<String>()
 
 fun notifAllowed(ctx: Context): Boolean =
-    android.os.Build.VERSION.SDK_INT < 33 ||
-        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    (android.os.Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED) &&
+        androidx.core.app.NotificationManagerCompat.from(ctx).areNotificationsEnabled()
 
 fun permsToAsk(): Array<String> =
     if (android.os.Build.VERSION.SDK_INT >= 33)
@@ -1179,6 +1185,9 @@ fun HomeScreen(
     val alertCtx = LocalContext.current
     var alertsOn by remember { mutableStateOf(LiveAlerts.enabled(alertCtx)) }
     val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(Unit) { // a phone that only watches never reaches the broadcast screen, so ask for the notification permission here
+        if (alertsOn && android.os.Build.VERSION.SDK_INT >= 33 && !notifAllowed(alertCtx)) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Live now", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f), maxLines = 1, softWrap = false)
@@ -1231,10 +1240,16 @@ fun HomeScreen(
             title = { Text("Diagnostics") },
             text = { SelectionContainer { Text(diagText(hctx), style = MaterialTheme.typography.bodySmall) } },
             dismissButton = {
-                TextButton({
+                Row {
+                    TextButton({
+                        Thread { try { LiveAlerts.check(hctx.applicationContext, force = true) } catch (e: Exception) {} }.start()
+                        showDiag = false
+                    }) { Text("Check alerts now") }
+                    TextButton({
                     val cm = hctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                     cm.setPrimaryClip(android.content.ClipData.newPlainText("diagnostics", diagText(hctx)))
-                }) { Text("Copy") }
+                    }) { Text("Copy") }
+                }
             },
             confirmButton = { TextButton({ showDiag = false }) { Text("Close") } }
         )

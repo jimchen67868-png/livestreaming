@@ -126,8 +126,8 @@ object Api {
     } catch (e: Exception) { null }
 
     /** Who sent my account lumis, as name to total, most first; null if the server can't be reached. */
-    fun lumisFrom(server: String): List<Pair<String, Long>>? = try {
-        http.newCall(Request.Builder().url("${base(server)}/lumis-from").header("X-Auth", auth).build()).execute().use { r ->
+    fun lumisFrom(server: String, name: String = ""): List<Pair<String, Long>>? = try {
+        http.newCall(Request.Builder().url("${base(server)}/lumis-from?u=" + java.net.URLEncoder.encode(name, "UTF-8")).header("X-Auth", auth).build()).execute().use { r ->
             if (!r.isSuccessful) null else {
                 val a = JSONObject(r.body!!.string()).optJSONArray("from") ?: JSONArray()
                 (0 until a.length()).map { a.getJSONObject(it).let { o -> o.optString("name") to o.optLong("lumis") } }
@@ -136,8 +136,8 @@ object Api {
     } catch (e: Exception) { null }
 
     /** Who I sent diamonds to, as name to total, most first; null if the server can't be reached. */
-    fun diamondsTo(server: String): List<Pair<String, Long>>? = try {
-        http.newCall(Request.Builder().url("${base(server)}/diamonds-to").header("X-Auth", auth).build()).execute().use { r ->
+    fun diamondsTo(server: String, name: String = ""): List<Pair<String, Long>>? = try {
+        http.newCall(Request.Builder().url("${base(server)}/diamonds-to?u=" + java.net.URLEncoder.encode(name, "UTF-8")).header("X-Auth", auth).build()).execute().use { r ->
             if (!r.isSuccessful) null else {
                 val a = JSONObject(r.body!!.string()).optJSONArray("to") ?: JSONArray()
                 (0 until a.length()).map { a.getJSONObject(it).let { o -> o.optString("name") to o.optLong("diamonds") } }

@@ -343,7 +343,7 @@ export default {
         if (env.DB) await env.DB.put(ck, JSON.stringify(items), { expirationTtl: 86400 });
         return json({ items });
       }
-      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b143', youtube: !!env.YT_KEY, accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
+      if (req.method === 'GET' && u.pathname === '/version') return json({ worker: 'b144', youtube: !!env.YT_KEY, accounts: !!env.DB, email: !!(env.BREVO_KEY && env.MAIL_FROM), payments: !!(env.STRIPE_KEY && env.STRIPE_WH) });
       // Lumis: the host earns them for each gift a logged-in viewer sends (amounts are fixed here on the server)
       if (req.method === 'POST' && u.pathname === '/gift') {
         if (!env.DB) return json({ error: 'no storage' }, 503);
@@ -733,8 +733,12 @@ export default {
       // who sent ME lumis, most first (only for the logged-in account)
       if (req.method === 'GET' && u.pathname === '/lumis-from') {
         if (!env.DB) return json({ from: [] });
-        const me = await userOf(req, env);
-        if (!me) return json({ error: 'Log in' }, 401);
+        let me = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20); // ?u=<name> shows that person's list; without it, your own (log in)
+        if (!me) {
+          const who = await userOf(req, env);
+          if (!who) return json({ error: 'Log in' }, 401);
+          me = who;
+        }
         const fm = (await env.DB.get('lf:' + me.toLowerCase(), 'json')) || {};
         const from = Object.values(fm).sort((x, y) => y.v - x.v).slice(0, 100).map((x) => ({ name: x.n, lumis: x.v }));
         return json({ from });
@@ -742,8 +746,12 @@ export default {
       // who I sent diamonds to, most first (only for the logged-in account)
       if (req.method === 'GET' && u.pathname === '/diamonds-to') {
         if (!env.DB) return json({ to: [] });
-        const me = await userOf(req, env);
-        if (!me) return json({ error: 'Log in' }, 401);
+        let me = String(u.searchParams.get('u') || '').toLowerCase().slice(0, 20); // ?u=<name> shows that person's list; without it, your own (log in)
+        if (!me) {
+          const who = await userOf(req, env);
+          if (!who) return json({ error: 'Log in' }, 401);
+          me = who;
+        }
         const tm = (await env.DB.get('lt:' + me.toLowerCase(), 'json')) || {};
         const to = Object.values(tm).sort((x, y) => y.v - x.v).slice(0, 100).map((x) => ({ name: x.n, diamonds: x.v }));
         return json({ to });

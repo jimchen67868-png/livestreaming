@@ -90,6 +90,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
@@ -381,7 +382,7 @@ private fun trimVideo(src: File, dst: File, startUs: Long, endUs: Long, keepAudi
 private class Pcm(val data: ShortArray, val rate: Int, val ch: Int)
 private class AacFrame(val data: ByteArray, val pts: Long, val flags: Int)
 private class Aac(val format: MediaFormat, val frames: List<AacFrame>)
-class TrimChoice(val startMs: Long, val endMs: Long, val mute: Boolean, val music: Uri?, val musicVol: Float, val musicStartMs: Long = 0L)
+class TrimChoice(val startMs: Long, val endMs: Long, val mute: Boolean, val music: Uri?, val musicVol: Float, val musicStartMs: Long = 0L, val musicEndMs: Long = 0L)
 
 // decodes the audio track of a file / uri from startUs for about lenUs into 16-bit PCM; null if there is no audio
 private fun decodeAudio(open: (MediaExtractor) -> Unit, startUs: Long, lenUs: Long): Pcm? {
@@ -665,8 +666,11 @@ private suspend fun buildClip(ctx: Context, src: File, dst: File, c: TrimChoice)
     if (music == null) return e
     return withContext(Dispatchers.IO) {
         val frames = (durUs * 44100L / 1000000L).toInt().coerceAtLeast(22050)
-        val song = decodeAudio({ it.setDataSource(ctx, music, null) }, c.musicStartMs * 1000L, durUs + 1000000L)
-        if (song == null) return@withContext "Could not read this music file"
+        val segUs = (c.musicEndMs - c.musicStartMs).coerceAtLeast(1000L) * 1000L // the chosen part of the song; it repeats if it is shorter than the video
+        val song0 = decodeAudio({ it.setDataSource(ctx, music, null) }, c.musicStartMs * 1000L, segUs)
+        if (song0 == null) return@withContext "Could not read this music file"
+        val keep = minOf(song0.data.size, ((segUs / 1000000.0) * song0.rate).toInt() * song0.ch) // exactly the chosen part
+        val song = Pcm(song0.data.copyOf(keep - keep % song0.ch), song0.rate, song0.ch)
         val mus = toStereo44(song, frames, true)
         var org: ShortArray? = null
         if (!c.mute) {
@@ -794,8 +798,8 @@ private fun MusicDialog(onPick: (Uri, String) -> Unit, onClose: () -> Unit) {
     )
 }
 
-// Edit a video before posting: choose the part (start and end, or a fixed length that slides), mute the original sound, add music.
-// The preview plays exactly the chosen part (ExoPlayer), and the posted video is cut at the same frames.
+// Edit a video before posting: choose the part (start and end, or a fixed length that slides), mute the original sound, add music
+// (its part of the song is chosen the same way). The preview keeps playing while you drag, and plays exactly the chosen part.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice) -> Unit, onCancel: () -> Unit) {
@@ -809,64 +813,55 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
     var music by remember { mutableStateOf<Uri?>(null) }
     var musicName by remember { mutableStateOf("") }
     var musicVol by remember { mutableStateOf(0.8f) }
-    var musicStart by remember { mutableStateOf(0f) } // where in the song the music part begins (ms)
-    var musicDur by remember { mutableStateOf(0L) }   // length of the song (ms), 0 = unknown
+    var mS by remember { mutableStateOf(0f) }          // the part of the song that is used: from mS to mE (ms)
+    var mE by remember { mutableStateOf(0f) }
+    var musicLock by remember { mutableStateOf(true) } // true = the music part is as long as the video part
+    var musicDur by remember { mutableStateOf(0L) }    // length of the song (ms), 0 = unknown
     var showMusic by remember { mutableStateOf(false) }
     var ratio by remember { mutableStateOf(16f / 9f) }
-    val exo = remember { ExoPlayer.Builder(ctx).build() }      // plays the chosen part of the video, in a loop
-    val musicExo = remember { ExoPlayer.Builder(ctx).build() } // plays the chosen music, in a loop
+    val exo = remember { ExoPlayer.Builder(ctx).build() }      // plays the video
+    val musicExo = remember { ExoPlayer.Builder(ctx).build() } // plays the song
 
-    // the part of the song that is used: as long as the video part, beginning at musicStart
-    fun musicFrom(): Long {
-        val len = (end - start).toLong().coerceAtLeast(500L)
-        return if (musicDur > 0L) minOf(musicStart.toLong(), (musicDur - len).coerceAtLeast(0L)) else musicStart.toLong()
-    }
-    fun loadMusic() {
-        val m = music ?: return
-        val len = (end - start).toLong().coerceAtLeast(500L)
-        val ms = musicFrom()
-        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(ms).setEndPositionMs(if (musicDur > 0L) minOf(ms + len, musicDur) else ms + len).build()
-        musicExo.setMediaItem(MediaItem.Builder().setUri(m).setClippingConfiguration(clip).build())
-        musicExo.prepare()
-        musicExo.volume = musicVol
-        musicExo.playWhenReady = true
-    }
-    // (re)loads the preview with the current start / end
-    fun loadClip() {
-        val clip = MediaItem.ClippingConfiguration.Builder().setStartPositionMs(start.toLong()).setEndPositionMs(maxOf(end.toLong(), start.toLong() + 500L)).build()
-        exo.setMediaItem(MediaItem.Builder().setUri(Uri.fromFile(src)).setClippingConfiguration(clip).build())
-        exo.prepare()
+    // jump the preview to the start of the chosen part and play (video and music together)
+    fun restart() {
+        exo.seekTo(start.toLong())
         exo.playWhenReady = true
-        loadMusic()
+        if (music != null) { musicExo.seekTo(mS.toLong()); musicExo.playWhenReady = true }
     }
     DisposableEffect(Unit) {
-        exo.repeatMode = Player.REPEAT_MODE_ONE
-        musicExo.repeatMode = Player.REPEAT_MODE_ALL
+        exo.setSeekParameters(SeekParameters.EXACT)
+        musicExo.setSeekParameters(SeekParameters.EXACT)
         exo.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.height > 0 && videoSize.width > 0) ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
             }
         })
-        loadClip()
+        exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
+        exo.prepare()
+        exo.seekTo(0L)
+        exo.playWhenReady = true
         onDispose {
             try { exo.release() } catch (e: Exception) {}
             try { musicExo.release() } catch (e: Exception) {}
         }
     }
-    LaunchedEffect(Unit) { // when the video loops, the music starts again with it
-        var last = 0L
+    LaunchedEffect(Unit) { // keeps the preview inside the chosen part, and loops it (the song loops inside its own part)
         while (true) {
-            delay(100)
+            delay(30)
             val p = exo.currentPosition
-            if (music != null && p + 300L < last) musicExo.seekTo(0L)
-            last = p
+            if (exo.playbackState == Player.STATE_ENDED || p >= end.toLong() - 15L || p < start.toLong() - 150L) restart()
+            if (music != null && (musicExo.playbackState == Player.STATE_ENDED || musicExo.currentPosition >= mE.toLong() - 15L)) {
+                musicExo.seekTo(mS.toLong())
+                musicExo.playWhenReady = true
+            }
         }
     }
     LaunchedEffect(mute) { exo.volume = if (mute) 0f else 1f }
     LaunchedEffect(musicVol) { musicExo.volume = musicVol }
     LaunchedEffect(music) {
         val m = music
-        musicStart = 0f
+        mS = 0f
+        mE = 0f
         if (m == null) {
             musicDur = 0L
             musicExo.stop()
@@ -881,7 +876,21 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                     d
                 } catch (e: Exception) { 0L }
             }
-            loadClip() // video and music start together
+            mE = if (musicDur > 0L) minOf((end - start).coerceAtLeast(500f), musicDur.toFloat()) else (end - start).coerceAtLeast(500f)
+            musicExo.setMediaItem(MediaItem.fromUri(m))
+            musicExo.volume = musicVol
+            musicExo.prepare()
+            restart() // video and music start together
+        }
+    }
+    // when the music part is "as long as the video part", it follows every change of the video part
+    LaunchedEffect(start, end, musicLock, musicDur, music) {
+        if (music != null && musicLock && musicDur > 0L) {
+            val d = musicDur.toFloat()
+            val l = minOf((end - start).coerceAtLeast(500f), d)
+            val ns = mS.coerceIn(0f, (d - l).coerceAtLeast(0f))
+            mS = ns
+            mE = ns + l
         }
     }
     fun mmss(ms: Long) = "%d:%02d.%d".format(ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100)
@@ -890,7 +899,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         val e = minOf(total, start + l)
         end = e
         start = (e - l).coerceAtLeast(0f)
-        loadClip()
+        restart()
     }
     AlertDialog(
         onDismissRequest = { if (!busy) onCancel() },
@@ -912,21 +921,24 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                     val l = minOf(lockLen, total)
                     // two handles, one fixed length: dragging either one moves both together
                     RangeSlider(start..end, { r ->
-                        exo.pause()
                         val ns = if (r.start != start) r.start else r.endInclusive - l
                         start = ns.coerceIn(0f, (total - l).coerceAtLeast(0f))
                         end = start + l
-                    }, valueRange = 0f..total, onValueChangeFinished = { loadClip() }, enabled = !busy)
+                        exo.seekTo(start.toLong())
+                        exo.playWhenReady = true
+                    }, valueRange = 0f..total, enabled = !busy)
                 } else {
                     RangeSlider(start..end, { r ->
-                        exo.pause()
                         var a = r.start
                         var e = r.endInclusive
                         val moved = a != start
                         if (moved) a = a.coerceIn((e - maxLen).coerceAtLeast(0f), (e - 1000f).coerceAtLeast(0f))
                         else e = e.coerceIn(minOf(a + 1000f, total), minOf(a + maxLen, total))
                         start = a; end = e
-                    }, valueRange = 0f..total, onValueChangeFinished = { loadClip() }, enabled = !busy)
+                        // keep playing while dragging: the start handle shows its own picture, the end handle shows the last second
+                        exo.seekTo((if (moved) a else (e - 1000f).coerceAtLeast(a)).toLong())
+                        exo.playWhenReady = true
+                    }, valueRange = 0f..total, enabled = !busy)
                 }
                 Text("Part used: ${mmss(start.toLong())} to ${mmss(end.toLong())}  (${"%.1f".format((end - start) / 1000f)} s of 8 s max)" + if (lockLen > 0f) "  - drag to move the whole part" else "", fontSize = 13.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -941,11 +953,34 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                 if (music != null) {
                     Text("Music volume", fontSize = 12.sp)
                     Slider(musicVol, { musicVol = it }, valueRange = 0f..1f, enabled = !busy)
-                    val mlen = (end - start).toLong().coerceAtLeast(500L)
-                    if (musicDur > mlen + 500L) {
-                        Text("Music part: ${mmss(musicFrom())} to ${mmss(musicFrom() + mlen)} of ${mmss(musicDur)}  - slide to choose where the music starts", fontSize = 12.sp)
-                        Slider(minOf(musicStart, (musicDur - mlen).toFloat()), { musicStart = it; musicExo.pause() },
-                            valueRange = 0f..(musicDur - mlen).toFloat(), onValueChangeFinished = { loadMusic(); musicExo.seekTo(0L) }, enabled = !busy)
+                    if (musicDur > 0L) {
+                        val d = musicDur.toFloat()
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Music part", fontSize = 13.sp)
+                            FilterChip(selected = musicLock, onClick = { musicLock = true }, label = { Text("Same length as video") }, enabled = !busy)
+                            FilterChip(selected = !musicLock, onClick = { musicLock = false }, label = { Text("Free") }, enabled = !busy)
+                        }
+                        // two handles on the song, like the video part
+                        RangeSlider(mS..mE, { r ->
+                            if (musicLock) {
+                                val l = mE - mS
+                                val ns = if (r.start != mS) r.start else r.endInclusive - l
+                                mS = ns.coerceIn(0f, (d - l).coerceAtLeast(0f))
+                                mE = mS + l
+                                musicExo.seekTo(mS.toLong())
+                            } else {
+                                var a = r.start
+                                var e = r.endInclusive
+                                val moved = a != mS
+                                if (moved) a = a.coerceIn(0f, (e - 1000f).coerceAtLeast(0f))
+                                else e = e.coerceIn(minOf(a + 1000f, d), d)
+                                mS = a; mE = e
+                                musicExo.seekTo((if (moved) a else (e - 500f).coerceAtLeast(a)).toLong())
+                            }
+                            musicExo.playWhenReady = true
+                        }, valueRange = 0f..d, enabled = !busy)
+                        Text("Music part: ${mmss(mS.toLong())} to ${mmss(mE.toLong())} of ${mmss(musicDur)}" +
+                            (if (!musicLock && mE - mS < end - start) "  - it repeats to fill the video" else ""), fontSize = 12.sp)
                     }
                 }
             }
@@ -954,7 +989,9 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
             Button({
                 exo.pause()
                 musicExo.pause()
-                onUse(TrimChoice(start.toLong(), end.toLong(), mute, music, musicVol, musicFrom()))
+                val ms = if (music != null && musicDur > 0L) mS.toLong() else 0L
+                val me = if (music != null && musicDur > 0L) mE.toLong() else (end - start).toLong()
+                onUse(TrimChoice(start.toLong(), end.toLong(), mute, music, musicVol, ms, me))
             }, enabled = !busy) { Text(if (busy) "Working…" else "Use this") }
         },
         dismissButton = { TextButton(onCancel, enabled = !busy) { Text("Cancel") } }
