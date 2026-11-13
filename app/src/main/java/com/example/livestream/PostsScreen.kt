@@ -63,6 +63,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -802,7 +803,7 @@ private fun MusicDialog(onPick: (Uri, String) -> Unit, onClose: () -> Unit) {
 // (its part of the song is chosen the same way). The preview keeps playing while you drag, and plays exactly the chosen part.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice) -> Unit, onCancel: () -> Unit) {
+private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse: (TrimChoice) -> Unit, onCancel: () -> Unit) {
     val ctx = LocalContext.current
     val maxLen = MAX_VIDEO_MS.toFloat()
     val total = durMs.toFloat()
@@ -819,8 +820,11 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
     var musicDur by remember { mutableStateOf(0L) }    // length of the song (ms), 0 = unknown
     var showMusic by remember { mutableStateOf(false) }
     var ratio by remember { mutableStateOf(16f / 9f) }
-    val exo = remember { ExoPlayer.Builder(ctx).build() }      // plays the video
-    val musicExo = remember { ExoPlayer.Builder(ctx).build() } // plays the song
+    var gen by remember { mutableStateOf(0) }            // the two players are rebuilt (gen + 1) when they were released to free the phone's codecs
+    var released by remember { mutableStateOf(false) }
+    var previewErr by remember { mutableStateOf("") }
+    val exo = remember(gen) { ExoPlayer.Builder(ctx).build() }      // plays the video
+    val musicExo = remember(gen) { ExoPlayer.Builder(ctx).build() } // plays the song
 
     // jump the preview to the start of the chosen part and play (video and music together)
     fun restart() {
@@ -828,26 +832,33 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         exo.playWhenReady = true
         if (music != null) { musicExo.seekTo(mS.toLong()); musicExo.playWhenReady = true }
     }
-    DisposableEffect(Unit) {
+    DisposableEffect(gen) {
         exo.setSeekParameters(SeekParameters.EXACT)
         musicExo.setSeekParameters(SeekParameters.EXACT)
         exo.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.height > 0 && videoSize.width > 0) ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
             }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) { previewErr = "Video preview problem: " + (error.errorCodeName) }
+        })
+        musicExo.addListener(object : Player.Listener {
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) { previewErr = "Music preview problem: " + (error.errorCodeName) }
         })
         exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
         exo.prepare()
-        exo.seekTo(0L)
+        exo.seekTo(start.toLong())
         exo.playWhenReady = true
         onDispose {
             try { exo.release() } catch (e: Exception) {}
             try { musicExo.release() } catch (e: Exception) {}
         }
     }
-    LaunchedEffect(Unit) { // keeps the preview inside the chosen part, and loops it (the song loops inside its own part)
+    // after the video is made (or failed) the previews are rebuilt, so that "Use this" can be tapped again
+    LaunchedEffect(busy) { if (!busy && released) { released = false; gen++ } }
+    LaunchedEffect(gen) { // keeps the preview inside the chosen part, and loops it (the song loops inside its own part)
         while (true) {
             delay(30)
+            if (released) continue // the players are freed while the video is being made
             val p = exo.currentPosition
             if (exo.playbackState == Player.STATE_ENDED || p >= end.toLong() - 15L || p < start.toLong() - 150L) restart()
             if (music != null && (musicExo.playbackState == Player.STATE_ENDED || musicExo.currentPosition >= mE.toLong() - 15L)) {
@@ -856,16 +867,14 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
             }
         }
     }
-    LaunchedEffect(mute) { exo.volume = if (mute) 0f else 1f }
-    LaunchedEffect(musicVol) { musicExo.volume = musicVol }
-    LaunchedEffect(music) {
+    LaunchedEffect(mute, gen) { exo.volume = if (mute) 0f else 1f }
+    LaunchedEffect(musicVol, gen) { musicExo.volume = musicVol }
+    LaunchedEffect(music) { // length of the song, and the first music part
         val m = music
         mS = 0f
         mE = 0f
         if (m == null) {
             musicDur = 0L
-            musicExo.stop()
-            musicExo.clearMediaItems()
         } else {
             musicDur = withContext(Dispatchers.IO) {
                 try {
@@ -877,6 +886,14 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
                 } catch (e: Exception) { 0L }
             }
             mE = if (musicDur > 0L) minOf((end - start).coerceAtLeast(500f), musicDur.toFloat()) else (end - start).coerceAtLeast(500f)
+        }
+    }
+    LaunchedEffect(music, gen) { // loads the song into its player
+        val m = music
+        if (m == null) {
+            musicExo.stop()
+            musicExo.clearMediaItems()
+        } else {
             musicExo.setMediaItem(MediaItem.fromUri(m))
             musicExo.volume = musicVol
             musicExo.prepare()
@@ -907,8 +924,10 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Your video is ${mmss(durMs)} long. A post can be 8 seconds at most. The preview plays exactly the part that will be posted.")
+                if (msg.isNotEmpty()) Text(msg, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                if (previewErr.isNotEmpty()) Text(previewErr, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                 Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
-                    AndroidView(factory = { c -> TextureView(c).also { exo.setVideoTextureView(it) } }, modifier = Modifier.aspectRatio(ratio))
+                    key(gen) { AndroidView(factory = { c -> TextureView(c).also { exo.setVideoTextureView(it) } }, modifier = Modifier.aspectRatio(ratio)) }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Length", fontSize = 13.sp)
@@ -987,8 +1006,10 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, onUse: (TrimChoice
         },
         confirmButton = {
             Button({
-                exo.pause()
-                musicExo.pause()
+                // free the phone's video and audio codecs first: making the video needs them too
+                released = true
+                try { exo.release() } catch (e: Exception) {}
+                try { musicExo.release() } catch (e: Exception) {}
                 val ms = if (music != null && musicDur > 0L) mS.toLong() else 0L
                 val me = if (music != null && musicDur > 0L) mE.toLong() else (end - start).toLong()
                 onUse(TrimChoice(start.toLong(), end.toLong(), mute, music, musicVol, ms, me))
@@ -1113,7 +1134,7 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
     )
 
     trimSrc?.let { src ->
-        TrimDialog(src, trimDur, busy, { ch ->
+        TrimDialog(src, trimDur, busy, msg, { ch ->
             scope.launch {
                 busy = true; msg = "Preparing video…"
                 val out = File(ctx.cacheDir, "post_upload.mp4")
