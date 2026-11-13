@@ -846,15 +846,20 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
         musicExo.playWhenReady = true
     }
     DisposableEffect(gen) {
+        previewErr = ""
         exo.setSeekParameters(SeekParameters.EXACT)
         exo.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.height > 0 && videoSize.width > 0) ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
             }
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) { previewErr = "Video preview problem: " + (error.errorCodeName) }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (previewErr.isEmpty()) previewErr = "Video preview problem: " + error.errorCodeName + (error.cause?.message?.let { " (" + it.take(80) + ")" } ?: "") + (if (src.exists()) "" else " - the video file is gone")
+            }
         })
         musicExo.addListener(object : Player.Listener {
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) { previewErr = "Music preview problem: " + (error.errorCodeName) }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (previewErr.isEmpty()) previewErr = "Music preview problem: " + error.errorCodeName + (error.cause?.message?.let { " (" + it.take(80) + ")" } ?: "")
+            }
         })
         exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
         exo.prepare()
@@ -870,16 +875,24 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
     LaunchedEffect(gen) { // keeps the preview inside the chosen part, and loops it (the song loops inside its own part)
         var lastPos = -1L
         var stuck = 0
+        var retries = 0
+        var retryAt = 0L
         while (true) {
             delay(30)
             if (released) continue // the players are freed while the video is being made
             val st = exo.playbackState
-            if (st == Player.STATE_IDLE) { // the video player stopped (an error): load the video again
-                exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
-                exo.prepare()
-                restart()
+            if (st == Player.STATE_IDLE) { // the video player stopped (an error): load the video again, a few times only
+                val now = System.currentTimeMillis()
+                if (retries < 3 && now >= retryAt) {
+                    retries++
+                    retryAt = now + 1500L
+                    exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
+                    exo.prepare()
+                    restart()
+                }
                 continue
             }
+            if (st == Player.STATE_READY) retries = 0
             val p = exo.currentPosition
             // playing but the picture is not moving for about a second: start the part again
             if (exo.playWhenReady && st == Player.STATE_READY && p == lastPos) stuck += 30 else stuck = 0
@@ -950,7 +963,10 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Your video is ${mmss(durMs)} long. A post can be 8 seconds at most. The preview plays exactly the part that will be posted.")
                 if (msg.isNotEmpty()) Text(msg, color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
-                if (previewErr.isNotEmpty()) Text(previewErr, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                if (previewErr.isNotEmpty()) {
+                    Text(previewErr, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                    TextButton({ gen++ }) { Text("Reload preview") }
+                }
                 Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
                     key(gen) { AndroidView(factory = { c -> TextureView(c).also { exo.setVideoTextureView(it) } }, modifier = Modifier.aspectRatio(ratio)) }
                 }
@@ -1071,7 +1087,7 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
         scope.launch {
             busy = true; msg = "Checking…"
             if (kind == "video") {
-                val src = File(ctx.cacheDir, "post_source.mp4")
+                val src = File(ctx.filesDir, "post_source.mp4") // not in the cache folder: the phone may clean that while you edit
                 val e = withContext(Dispatchers.IO) { copyVideo(ctx, uri, src) }
                 if (e.isNotEmpty()) { busy = false; msg = e; return@launch }
                 val dur = withContext(Dispatchers.IO) { videoDurationMs(src) }
@@ -1167,9 +1183,10 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
                 val v = withContext(Dispatchers.Default) { checkVideo(if (untouched) src else out) }
                 busy = false
                 trimSrc = null
+                if (!untouched) { try { src.delete() } catch (e: Exception) {} } // the edited copy is what gets posted
                 if (v.first != null) { prep = v.first; caption = ""; msg = "" } else msg = v.second
             }
-        }, { trimSrc = null; msg = "" })
+        }, { try { trimSrc?.delete() } catch (e: Exception) {}; trimSrc = null; msg = "" })
     }
 
     prep?.let { p ->
