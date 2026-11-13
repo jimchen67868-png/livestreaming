@@ -868,11 +868,24 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
     // after the video is made (or failed) the previews are rebuilt, so that "Use this" can be tapped again
     LaunchedEffect(busy) { if (!busy && released) { released = false; gen++ } }
     LaunchedEffect(gen) { // keeps the preview inside the chosen part, and loops it (the song loops inside its own part)
+        var lastPos = -1L
+        var stuck = 0
         while (true) {
             delay(30)
             if (released) continue // the players are freed while the video is being made
+            val st = exo.playbackState
+            if (st == Player.STATE_IDLE) { // the video player stopped (an error): load the video again
+                exo.setMediaItem(MediaItem.fromUri(Uri.fromFile(src)))
+                exo.prepare()
+                restart()
+                continue
+            }
             val p = exo.currentPosition
-            if (exo.playbackState == Player.STATE_ENDED || p >= end.toLong() - 15L || p < start.toLong() - 150L) restart()
+            // playing but the picture is not moving for about a second: start the part again
+            if (exo.playWhenReady && st == Player.STATE_READY && p == lastPos) stuck += 30 else stuck = 0
+            lastPos = p
+            if (stuck >= 900) { stuck = 0; restart() }
+            if (st == Player.STATE_ENDED || p >= end.toLong() - 15L || p < start.toLong() - 150L) restart()
             if (music != null && mE > mS + 200f && (musicExo.playbackState == Player.STATE_ENDED || musicExo.currentPosition >= mE.toLong() - 15L)) {
                 musicExo.seekTo(mS.toLong())
                 musicExo.playWhenReady = true
@@ -956,7 +969,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                         start = ns.coerceIn(0f, (total - l).coerceAtLeast(0f))
                         end = start + l
                         seekVideo(start.toLong())
-                    }, valueRange = 0f..total, enabled = !busy)
+                    }, valueRange = 0f..total, onValueChangeFinished = { restart() }, enabled = !busy)
                 } else {
                     RangeSlider(start..end, { r ->
                         var a = r.start
@@ -967,12 +980,12 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                         start = a; end = e
                         // keep playing while dragging: the start handle shows its own picture, the end handle shows the last second
                         seekVideo((if (moved) a else (e - 1000f).coerceAtLeast(a)).toLong())
-                    }, valueRange = 0f..total, enabled = !busy)
+                    }, valueRange = 0f..total, onValueChangeFinished = { restart() }, enabled = !busy)
                 }
                 Text("Part used: ${mmss(start.toLong())} to ${mmss(end.toLong())}  (${"%.1f".format((end - start) / 1000f)} s of 8 s max)" + if (lockLen > 0f) "  - drag to move the whole part" else "", fontSize = 13.sp)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Original sound", Modifier.weight(1f))
-                    Switch(checked = !mute, onCheckedChange = { mute = !it }, enabled = !busy)
+                    Switch(checked = !mute, onCheckedChange = { mute = !it; exo.volume = if (mute) 0f else 1f; restart() }, enabled = !busy)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(if (music == null) "No music" else "Music: $musicName", Modifier.weight(1f), maxLines = 2)
@@ -986,8 +999,8 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                         val d = musicDur.toFloat()
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text("Music part", fontSize = 13.sp)
-                            FilterChip(selected = musicLock, onClick = { musicLock = true }, label = { Text("Same length as video") }, enabled = !busy)
-                            FilterChip(selected = !musicLock, onClick = { musicLock = false }, label = { Text("Free") }, enabled = !busy)
+                            FilterChip(selected = musicLock, onClick = { musicLock = true; restart() }, label = { Text("Same length as video") }, enabled = !busy)
+                            FilterChip(selected = !musicLock, onClick = { musicLock = false; restart() }, label = { Text("Free") }, enabled = !busy)
                         }
                         // two handles on the song, like the video part
                         RangeSlider(mS..mE, { r ->
@@ -1006,7 +1019,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                                 mS = a; mE = e
                                 seekMusic((if (moved) a else (e - 500f).coerceAtLeast(a)).toLong())
                             }
-                        }, valueRange = 0f..d, enabled = !busy)
+                        }, valueRange = 0f..d, onValueChangeFinished = { restart() }, enabled = !busy)
                         Text("Music part: ${mmss(mS.toLong())} to ${mmss(mE.toLong())} of ${mmss(musicDur)}" +
                             (if (!musicLock && mE - mS < end - start) "  - it repeats to fill the video" else ""), fontSize = 12.sp)
                     }
