@@ -832,9 +832,21 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
         exo.playWhenReady = true
         if (music != null) { musicExo.seekTo(mS.toLong()); musicExo.playWhenReady = true }
     }
+    // while a handle is dragged, seek at most ~8 times a second (more would starve the phone and the slider)
+    var lastSeekV by remember { mutableStateOf(0L) }
+    var lastSeekM by remember { mutableStateOf(0L) }
+    fun seekVideo(ms: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastSeekV > 120L) { lastSeekV = now; exo.seekTo(ms) }
+        exo.playWhenReady = true
+    }
+    fun seekMusic(ms: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastSeekM > 120L) { lastSeekM = now; musicExo.seekTo(ms) }
+        musicExo.playWhenReady = true
+    }
     DisposableEffect(gen) {
         exo.setSeekParameters(SeekParameters.EXACT)
-        musicExo.setSeekParameters(SeekParameters.EXACT)
         exo.addListener(object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 if (videoSize.height > 0 && videoSize.width > 0) ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
@@ -861,7 +873,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
             if (released) continue // the players are freed while the video is being made
             val p = exo.currentPosition
             if (exo.playbackState == Player.STATE_ENDED || p >= end.toLong() - 15L || p < start.toLong() - 150L) restart()
-            if (music != null && (musicExo.playbackState == Player.STATE_ENDED || musicExo.currentPosition >= mE.toLong() - 15L)) {
+            if (music != null && mE > mS + 200f && (musicExo.playbackState == Player.STATE_ENDED || musicExo.currentPosition >= mE.toLong() - 15L)) {
                 musicExo.seekTo(mS.toLong())
                 musicExo.playWhenReady = true
             }
@@ -943,8 +955,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                         val ns = if (r.start != start) r.start else r.endInclusive - l
                         start = ns.coerceIn(0f, (total - l).coerceAtLeast(0f))
                         end = start + l
-                        exo.seekTo(start.toLong())
-                        exo.playWhenReady = true
+                        seekVideo(start.toLong())
                     }, valueRange = 0f..total, enabled = !busy)
                 } else {
                     RangeSlider(start..end, { r ->
@@ -955,8 +966,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                         else e = e.coerceIn(minOf(a + 1000f, total), minOf(a + maxLen, total))
                         start = a; end = e
                         // keep playing while dragging: the start handle shows its own picture, the end handle shows the last second
-                        exo.seekTo((if (moved) a else (e - 1000f).coerceAtLeast(a)).toLong())
-                        exo.playWhenReady = true
+                        seekVideo((if (moved) a else (e - 1000f).coerceAtLeast(a)).toLong())
                     }, valueRange = 0f..total, enabled = !busy)
                 }
                 Text("Part used: ${mmss(start.toLong())} to ${mmss(end.toLong())}  (${"%.1f".format((end - start) / 1000f)} s of 8 s max)" + if (lockLen > 0f) "  - drag to move the whole part" else "", fontSize = 13.sp)
@@ -986,7 +996,7 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                                 val ns = if (r.start != mS) r.start else r.endInclusive - l
                                 mS = ns.coerceIn(0f, (d - l).coerceAtLeast(0f))
                                 mE = mS + l
-                                musicExo.seekTo(mS.toLong())
+                                seekMusic(mS.toLong())
                             } else {
                                 var a = r.start
                                 var e = r.endInclusive
@@ -994,9 +1004,8 @@ private fun TrimDialog(src: File, durMs: Long, busy: Boolean, msg: String, onUse
                                 if (moved) a = a.coerceIn(0f, (e - 1000f).coerceAtLeast(0f))
                                 else e = e.coerceIn(minOf(a + 1000f, d), d)
                                 mS = a; mE = e
-                                musicExo.seekTo((if (moved) a else (e - 500f).coerceAtLeast(a)).toLong())
+                                seekMusic((if (moved) a else (e - 500f).coerceAtLeast(a)).toLong())
                             }
-                            musicExo.playWhenReady = true
                         }, valueRange = 0f..d, enabled = !busy)
                         Text("Music part: ${mmss(mS.toLong())} to ${mmss(mE.toLong())} of ${mmss(musicDur)}" +
                             (if (!musicLock && mE - mS < end - start) "  - it repeats to fill the video" else ""), fontSize = 12.sp)
