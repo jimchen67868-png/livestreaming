@@ -254,6 +254,10 @@ fun resultText(l: Int, r: Int, ln: String, rn: String) =
 fun viewerCount(room: Room) = room.remoteParticipants.values.count { !isGuest(it.identity?.value) }
 // Guests are named guest1234; the server does not let accounts use such names.
 fun isGuestAccount(n: String) = Regex("(?i)guest\\d{4}").matches(n.removeSuffix(" (you)").trim())
+// everyone in the room who has an account (host and viewers), for the @name suggestions in the chat
+fun roomNames(room: Room): List<String> = room.remoteParticipants.values
+    .filter { !isGuest(it.identity?.value) }
+    .map { it.name ?: it.identity?.value ?: "" }
 fun viewerNames(room: Room): List<String> = room.remoteParticipants.values
     .filter { !isHost(it.identity?.value) && !isGuest(it.identity?.value) }
     .map { it.name ?: it.identity?.value ?: "guest" }
@@ -633,7 +637,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b160-chatmentions"
+const val BUILD_TAG = "b162-commentnames"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1026,7 +1030,7 @@ fun SideBtn(text: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Boolean = true, onSend: (String) -> Unit) {
+fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Boolean = true, people: () -> List<String> = { emptyList() }, onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
     val cctx = LocalContext.current
     val myName = remember { cctx.getSharedPreferences("s", 0).getString("acct", "") ?: "" }
@@ -1066,7 +1070,7 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Bo
                 val seenN = HashSet<String>()
                 val cands = ArrayList<String>()
                 val speakers = msgs.reversed().filter { it.contains(":") }.map { it.substringBefore(":").replace(" (broadcaster)", "").trim() }
-                for (n in speakers + Follows.list(cctx)) {
+                for (n in people() + speakers + Follows.list(cctx)) {
                     val k = n.lowercase()
                     if (Regex("[A-Za-z0-9_]{3,16}").matches(n) && !k.equals(myName.lowercase()) && k.startsWith(q) && seenN.add(k)) cands.add(n)
                 }
@@ -1513,7 +1517,7 @@ fun WatchScreen(server: String, user: String, stream: Api.Stream, onSwitch: (Str
                     }
                 }
             }
-            ChatOverlay(msgs, onSend = {
+            ChatOverlay(msgs, people = { roomNames(lk) }, onSend = {
                 msgs.addCapped("$user: $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
@@ -2020,7 +2024,7 @@ fun BroadcastContent(server: String, user: String, onGuest: (String, String) -> 
         var showTools by remember { mutableStateOf(false) } // the live tools (mic, PK, flip, record...) are hidden until the Tools button is tapped
         var showChat by remember { mutableStateOf(false) } // the chat input is hidden until the Chat button is tapped
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, showInput = showChat, onSend = {
+            if (live) ChatOverlay(msgs, Modifier.graphicsLayer { translationX = offsetX.value; alpha = (1f + offsetX.value / wPx).coerceIn(0f, 1f) }, showInput = showChat, people = { roomNames(lk) }, onSend = {
                 msgs.addCapped("$user (broadcaster): $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
@@ -2200,7 +2204,7 @@ fun GuestScreen(server: String, user: String, room: String, from: String, onBack
             if (notice.isNotEmpty()) Text(notice, color = Color(0xFFFFD54F), modifier = Modifier.padding(12.dp))
         }
         Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            ChatOverlay(msgs, onSend = {
+            ChatOverlay(msgs, people = { roomNames(lk) }, onSend = {
                 msgs.addCapped("$user: $it")
                 scope.launch { lk.send(JSONObject().put("t", "chat").put("text", it)) }
             })
