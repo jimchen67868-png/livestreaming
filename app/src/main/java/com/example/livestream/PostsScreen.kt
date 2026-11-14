@@ -63,6 +63,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.runtime.key
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -1227,6 +1234,27 @@ fun PostsScreen(server: String, user: String, openNew: Boolean = false, onBack: 
     }
 }
 
+// a comment / chat line where @name is blue and can be tapped to open that person's profile
+@Composable
+fun MentionText(text: String, modifier: Modifier = Modifier, baseColor: Color = Color.White, bold: Boolean = false, onMention: (String) -> Unit) {
+    val ann = remember(text) {
+        buildAnnotatedString {
+            var last = 0
+            Regex("@[A-Za-z0-9_]{3,16}").findAll(text).forEach { m ->
+                append(text.substring(last, m.range.first))
+                pushStringAnnotation("user", m.value.substring(1))
+                withStyle(SpanStyle(color = Color(0xFF64B5F6), fontWeight = FontWeight.Bold)) { append(m.value) }
+                pop()
+                last = m.range.last + 1
+            }
+            append(text.substring(last))
+        }
+    }
+    ClickableText(ann, modifier = modifier, style = TextStyle(color = baseColor, fontSize = 14.sp, fontWeight = if (bold) FontWeight.Bold else null), onClick = { off ->
+        ann.getStringAnnotations("user", off, off).firstOrNull()?.let { onMention(it.item) }
+    })
+}
+
 @Composable
 fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, onDeleted: () -> Unit, onRemoved: () -> Unit = {}) {
     val ctx = LocalContext.current
@@ -1236,9 +1264,11 @@ fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, 
     var showComments by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf("") }
     var cmsg by remember { mutableStateOf("") }
+    var openName by remember { mutableStateOf("") } // a name tapped in a comment: its profile opens
     LaunchedEffect(p.id) { info = withContext(Dispatchers.IO) { Api.postInfo(server, p.id) } }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            if (openName.isNotEmpty()) ProfileDialog(openName, false, openName.equals(me, ignoreCase = true)) { openName = "" }
             if (p.kind == "text") {
                 val txt by produceState<String?>(null, p.id) {
                     value = withContext(Dispatchers.IO) { Api.fetchBytes(server, "post/${p.id}")?.toString(Charsets.UTF_8) }
@@ -1300,8 +1330,8 @@ fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, 
                             cs.forEach { c ->
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Column(Modifier.weight(1f)) {
-                                        Text(c.user + "  " + timeAgo(c.ts), color = Color(0xFFFFD54F), fontSize = 11.sp)
-                                        Text(c.text, color = Color.White, fontSize = 14.sp)
+                                        Text(c.user + "  " + timeAgo(c.ts), color = Color(0xFFFFD54F), fontSize = 11.sp, modifier = Modifier.clickable { openName = c.user })
+                                        MentionText(c.text) { openName = it }
                                     }
                                     if (mine || (me.isNotEmpty() && c.user.equals(me, ignoreCase = true))) TextButton({
                                         scope.launch { withContext(Dispatchers.IO) { Api.uncomment(server, p.id, c.ts) }?.let { info = it } }
@@ -1310,9 +1340,26 @@ fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, 
                             }
                         }
                         if (me.isEmpty()) Text("Log in to comment", color = Color(0xFFBBBBBB), fontSize = 13.sp)
-                        else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        else {
+                        // typing @ and a few letters: suggest the owner of the post, the people who commented and the people you follow
+                        val tail = Regex("@([A-Za-z0-9_]*)$").find(draft)
+                        if (tail != null) {
+                            val q = tail.groupValues[1].lowercase()
+                            val seenN = HashSet<String>()
+                            val cands = ArrayList<String>()
+                            for (n in listOf(p.user) + cs.map { it.user } + Follows.list(ctx)) {
+                                val k = n.lowercase()
+                                if (n.isNotBlank() && k != me.lowercase() && k.startsWith(q) && seenN.add(k)) cands.add(n)
+                            }
+                            if (cands.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                cands.take(10).forEach { n ->
+                                    OutlinedButton({ draft = (draft.substring(0, tail.range.first) + "@" + n + " ").take(200) }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)) { Text("@" + n, fontSize = 12.sp) }
+                                }
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedTextField(draft, { draft = it.take(200) }, Modifier.weight(1f), singleLine = true,
-                                textStyle = LocalTextStyle.current.copy(color = Color.White), placeholder = { Text("Add a comment…") })
+                                textStyle = LocalTextStyle.current.copy(color = Color.White), placeholder = { Text("Add a comment… use @name") })
                             Button({
                                 val text = draft.trim()
                                 scope.launch {
@@ -1320,6 +1367,7 @@ fun PostViewer(server: String, p: Api.Post, mine: Boolean, onClose: () -> Unit, 
                                     if (r != null) { info = r; draft = ""; cmsg = "" } else cmsg = "Could not send the comment"
                                 }
                             }, enabled = draft.isNotBlank()) { Text("Send") }
+                        }
                         }
                         if (cmsg.isNotEmpty()) Text(cmsg, color = Color(0xFFFF8A80), fontSize = 12.sp)
                     }

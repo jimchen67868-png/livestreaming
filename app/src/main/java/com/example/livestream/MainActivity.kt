@@ -633,7 +633,7 @@ fun YtView(modifier: Modifier, host: Boolean, cmd: JSONObject?, onHostState: (JS
     }
 }
 
-const val BUILD_TAG = "b158-previewfix"
+const val BUILD_TAG = "b160-chatmentions"
 
 // Your Worker address. When set, the app uses it and the Server URL box is hidden. Leave "" to type it in the app.
 const val DEFAULT_SERVER = "https://old-moon-cd21.jimchen67688.workers.dev"
@@ -1028,6 +1028,9 @@ fun SideBtn(text: String, selected: Boolean, onClick: () -> Unit) {
 @Composable
 fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Boolean = true, onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
+    val cctx = LocalContext.current
+    val myName = remember { cctx.getSharedPreferences("s", 0).getString("acct", "") ?: "" }
+    var openName by remember { mutableStateOf("") } // a name tapped in the chat: its profile opens
     Column(modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         // scrollable: swipe up to read older messages; it follows new messages unless you scrolled up
         val listState = rememberLazyListState()
@@ -1041,11 +1044,13 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Bo
                 val it = msgs[i]
                 // lines from the host are gold and bold. Only the part before the first ":" is checked, so a viewer cannot fake it in a message.
                 val fromBroadcaster = it.substringBefore(":").contains("(broadcaster)")
-                Text(it, color = if (fromBroadcaster) Color(0xFFFFD54F) else Color.White,
-                    fontWeight = if (fromBroadcaster) androidx.compose.ui.text.font.FontWeight.Bold else null,
+                // a line that @mentions you gets a blue background
+                val toMe = myName.isNotEmpty() && it.contains(":") &&
+                    Regex("@" + Regex.escape(myName) + "(?![A-Za-z0-9_])", RegexOption.IGNORE_CASE).containsMatchIn(it.substringAfter(":"))
+                MentionText(it, baseColor = if (fromBroadcaster) Color(0xFFFFD54F) else Color.White, bold = fromBroadcaster,
                     modifier = Modifier
-                        .background(Color(0x66000000), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 8.dp, vertical = 2.dp))
+                        .background(if (toMe) Color(0xCC1565C0) else Color(0x66000000), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 8.dp, vertical = 2.dp)) { openName = it }
             }
         }
         if (!showInput) {
@@ -1053,11 +1058,31 @@ fun ChatOverlay(msgs: List<String>, modifier: Modifier = Modifier, showInput: Bo
         } else if (Api.auth.isEmpty()) {
             Text("Log in (👤 on Home) to chat", color = Color.White, modifier = Modifier
                 .background(Color(0x66000000), RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
-        } else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(text, { text = it }, placeholder = { Text("Say something") },
-                singleLine = true, modifier = Modifier.weight(1f))
-            Button({ if (text.isNotBlank()) { onSend(text); text = "" } }) { Text("Send") }
+        } else {
+            // typing @ and a few letters: suggest the people who chatted here and the people you follow
+            val tail = Regex("@([A-Za-z0-9_]*)$").find(text)
+            if (tail != null) {
+                val q = tail.groupValues[1].lowercase()
+                val seenN = HashSet<String>()
+                val cands = ArrayList<String>()
+                val speakers = msgs.reversed().filter { it.contains(":") }.map { it.substringBefore(":").replace(" (broadcaster)", "").trim() }
+                for (n in speakers + Follows.list(cctx)) {
+                    val k = n.lowercase()
+                    if (Regex("[A-Za-z0-9_]{3,16}").matches(n) && !k.equals(myName.lowercase()) && k.startsWith(q) && seenN.add(k)) cands.add(n)
+                }
+                if (cands.isNotEmpty()) Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    cands.take(10).forEach { n ->
+                        Button({ text = text.substring(0, tail.range.first) + "@" + n + " " }, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)) { Text("@" + n, fontSize = 12.sp) }
+                    }
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(text, { text = it }, placeholder = { Text("Say something, @name to mention") },
+                    singleLine = true, modifier = Modifier.weight(1f))
+                Button({ if (text.isNotBlank()) { onSend(text); text = "" } }) { Text("Send") }
+            }
         }
+        if (openName.isNotEmpty()) ProfileDialog(openName, false, openName.equals(myName, ignoreCase = true)) { openName = "" }
     }
 }
 
